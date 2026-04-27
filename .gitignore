@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Build / distribución
+build/
+dist/
+*.spec
+
+# Logs
+logs/
+src/logs/
+*.log
+
+# Datos de sesión y caché local
+config/session.json
+src/data/Datos_Cargados/
+
+# Archivos de datos grandes (no versionables)
+Names_TicaPortal.xlsx
+
+# Claude Code internal
+.claude/

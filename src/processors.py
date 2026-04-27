@@ -1,8 +1,12 @@
 # processors.py
 
 import os
+import re
 import time
 import gc
+
+
+
 import pandas as pd
 import logging
 from threading import Lock
@@ -20,6 +24,11 @@ from selenium.common.exceptions import (
     NoSuchElementException, TimeoutException, StaleElementReferenceException
 )
 
+
+# Conjunto global de DUAs ya procesados (clave: numero_del_dua)
+PROCESSED_DUAS = set()
+PROCESSED_DUAS_LOCK = Lock()
+
 # Definir excepción personalizada para el caso de no encontrar filas
 class NoRowsException(Exception):
     pass
@@ -29,6 +38,26 @@ def set_zoom_level(driver, zoom_percentage):
     """Ajustar el nivel de zoom de la página."""
     zoom_script = f"document.body.style.zoom='{zoom_percentage}%'"
     driver.execute_script(zoom_script)
+
+
+import requests
+
+def esperar_disponibilidad_pagina(url, intervalo=10, max_intentos=0):
+    intentos = 0
+    while True:
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                logging.info(f"La página {url} está disponible nuevamente.")
+                return
+        except requests.RequestException:
+            pass
+        intentos += 1
+        logging.warning(f"La página {url} aún no está disponible. Intento {intentos}. Reintentando en {intervalo} segundos...")
+        time.sleep(intervalo)
+        if max_intentos and intentos >= max_intentos:
+            logging.error(f"No se pudo acceder a la página {url} después de {max_intentos} intentos.")
+            break
 
 
 class DUAProcessor:
@@ -48,11 +77,8 @@ class DUAProcessor:
     def get_browser_instance(self):
         options = EdgeOptions()
 
-        # Ejecutar en modo con cabeza (interfaz gráfica)
-        # Elimina o comenta la siguiente línea si no deseas el modo headless
         #options.add_argument('--headless')
 
-        # Deshabilitar características innecesarias
         options.add_argument('--disable-extensions')
         options.add_argument('--disable-popup-blocking')
         options.add_argument('--disable-notifications')
@@ -64,22 +90,18 @@ class DUAProcessor:
         options.add_argument('--disable-features=NetworkService')
         options.add_argument('--disable-blink-features=AutomationControlled')
 
-        # Crear instancia del navegador Edge con Selenium
         service = EdgeService(executable_path=self.config['edge_driver_path'])
         driver = webdriver.Edge(service=service, options=options)
 
-        # Definir tipos de recursos a bloquear (si fuera necesario con Selenium Wire o similar)
         blocked_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.css', '.woff', '.woff2', '.ttf', '.otf', '.svg']
 
-        # Función para interceptar y bloquear solicitudes (si usaras Selenium Wire)
-        # def interceptor(request):
-        #     if any(request.path.endswith(ext) for ext in blocked_extensions):
-        #         request.abort()
-        # driver.request_interceptor = interceptor
+        def interceptor(request):
+            if any(request.path.endswith(ext) for ext in blocked_extensions):
+                request.abort()
 
-        # Navegar a la página inicial
-        driver.get('https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx')
-        #time.sleep(2)  # <-- Nueva pausa de 2s
+        driver.request_interceptor = interceptor
+
+        #driver.get('https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx')
         return driver
 
     def process_dua(self, index, row, progress_callback):
@@ -98,7 +120,21 @@ class DUAProcessor:
             while retry_count < max_retries and not self.stop_event.is_set():
                 try:
                     # Volver a la página principal
-                    self.driver.get('https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx')
+                    try:
+                        self.driver.get('https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx')
+                    except WebDriverException as e:
+                        if "ERR_NAME_NOT_RESOLVED" in str(e):
+                            logging.warning("Error DNS: página no disponible. Esperando disponibilidad...")
+                            esperar_disponibilidad_pagina("https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx",
+                                                          intervalo=10)
+                            try:
+                                self.driver.get('https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx')
+                            except Exception as e2:
+                                logging.error(f"No se pudo cargar la página tras la espera: {e2}")
+                                self.log_failed_dua(dua_number)
+                                return
+                        else:
+                            raise
                     # Opcional: pausa corta para asegurarnos que la página se cargue
                     # time.sleep(2)
                     set_zoom_level(self.driver, 25)
@@ -133,20 +169,36 @@ class DUAProcessor:
                             new_data['numero_del_dua'].iloc[0].strip() == ""):
                         raise Exception(f"Datos vacíos o inválidos extraídos para el DUA: {row['Número']}")
 
-                    # Guardar los datos en el CSV
-                    output_csv_path = self.config['output_csv']
-                    if not os.path.exists(output_csv_path):
-                        new_data.to_csv(output_csv_path, mode='w', header=True, index=False, encoding='utf-8-sig')
-                    else:
-                        new_data.to_csv(output_csv_path, mode='a', header=False, index=False, encoding='utf-8-sig')
-
-                    extracted_dua = new_data.iloc[0]['numero_del_dua']
+                    # Tomar el número del DUA desde la página (clave única)
+                    extracted_dua = new_data.iloc[0]['numero_del_dua'].strip()
                     logging.info(f"Dua extraída: {extracted_dua}")
 
+                    # === NUEVO: control global de duplicados por numero_del_dua ===
+                    with PROCESSED_DUAS_LOCK:
+                        if extracted_dua in PROCESSED_DUAS:
+                            logging.warning(
+                                f"DUA {extracted_dua} ya estaba procesado (set global). "
+                                f"No se escribirá de nuevo."
+                            )
+                            # Consideramos este DUA como ya atendido y salimos del método
+                            return
+                        # Marcar este DUA como procesado
+                        PROCESSED_DUAS.add(extracted_dua)
+                    # === FIN CONTROL DUPLICADOS ===
+
+                    # Guardar los datos en el CSV (protegido por el lock del archivo)
+                    output_csv_path = self.config['output_csv']
                     with self.lock:
+                        if not os.path.exists(output_csv_path):
+                            new_data.to_csv(output_csv_path, mode='w', header=True, index=False, encoding='utf-8-sig')
+                        else:
+                            new_data.to_csv(output_csv_path, mode='a', header=False, index=False, encoding='utf-8-sig')
+
+                        # Actualizar progreso dentro del mismo lock
                         if index > self.max_index_processed:
                             self.max_index_processed = index
                             progress_callback(self.max_index_processed)
+
                     break  # Salir del bucle si todo salió bien
 
                 except (
@@ -164,13 +216,13 @@ class DUAProcessor:
                     continue
 
             if retry_count >= max_retries:
-                logging.error(f"Máximo de reintentos alcanzado para el DUA {row['Número']}. Reiniciando navegador.")
+                logging.error(f"Máximo de reintentos alcanzado para el DUA {row['numero_del_dua']}. Reiniciando navegador.")
                 self.driver.quit()
                 self.driver = self.get_browser_instance()
-                self.log_failed_dua(row['Número'])
+                self.log_failed_dua(row['numero_del_dua'])
 
             # Regresar a la página principal para el siguiente DUA
-            self.driver.get('https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx')
+            self.driver.get('https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx')
         except Exception as e:
             logging.exception(f"Error general al procesar DUA {dua_number}: {e}")
 
@@ -184,7 +236,7 @@ class DUAProcessor:
             while retries < max_retries and not self.stop_event.is_set():
                 try:
                     # Navegar a la página principal
-                    self.driver.get('https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx')
+                    self.driver.get('https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx')
                     #time.sleep(2)  # <-- Nueva pausa de 2s
                     # Establecer el zoom de la página al 25%
                     set_zoom_level(self.driver, 25)
@@ -230,6 +282,17 @@ class DUAProcessor:
                     #time.sleep(2)  # <-- Nueva pausa de 2s tras cargar la página
                     return True
 
+                except WebDriverException as e:
+                    if "ERR_NAME_NOT_RESOLVED" in str(e):
+                        logging.warning("Error DNS: página no disponible. Esperando disponibilidad...")
+                        esperar_disponibilidad_pagina("https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx",
+                                                      intervalo=10)
+                        continue
+                    retries += 1
+                    logging.warning(
+                        f"WebDriverException para DUA {dua_number}: {e}. Reintentando ({retries}/{max_retries})...")
+                    continue
+
                 except (TimeoutException, NoSuchElementException, StaleElementReferenceException, WebDriverException) as e:
                     retries += 1
                     logging.warning(
@@ -259,12 +322,20 @@ class DUAProcessor:
         """
         soup = BeautifulSoup(current_page_source, 'html.parser')
         time.sleep(0.5)
+
+        def clean_text(text: str) -> str:
+            # Reemplaza tabs, saltos de línea, NBSP y espacios múltiples
+            text = text.replace('\xa0', ' ')  # NBSP
+            text = re.sub(r'\s+', ' ', text)  # Cualquier \t, \n, \r, o espacio repetido → 1 espacio
+            return text.strip()
+
         def get_combined_text(ids):
             texts = []
             for id_ in ids:
                 elem = soup.find('span', {'id': id_})
                 if elem:
-                    text = elem.get_text(strip=True)
+                    raw = elem.get_text()  # sin strip=True, ya limpiamos nosotros
+                    text = clean_text(raw)
                     if text:
                         texts.append(text)
             return ' - '.join(texts)
@@ -274,7 +345,8 @@ class DUAProcessor:
             for id_ in ids:
                 elem = soup.find('span', {'id': id_})
                 if elem:
-                    text = elem.get_text(strip=True)
+                    raw = elem.get_text()
+                    text = clean_text(raw)
                     if text:
                         texts.append(text)
             return '-'.join(texts)
@@ -284,7 +356,8 @@ class DUAProcessor:
             for id_ in ids:
                 elem = soup.find('span', {'id': id_})
                 if elem:
-                    text = elem.get_text(strip=True)
+                    raw = elem.get_text()
+                    text = clean_text(raw)
                     if text:
                         texts.append(text)
             return ' '.join(texts) if texts else ''
@@ -376,3 +449,18 @@ class DUAProcessor:
             )
         except Exception as e:
             print(f"Error al esperar la desaparición del 'velo': {e}")
+def load_processed_duas_from_csv(output_csv_path):
+    """
+    Carga en PROCESSED_DUAS todos los 'numero_del_dua' ya presentes en el CSV de salida.
+    Útil para reanudar ejecuciones sin volver a guardar duplicados.
+    """
+    if os.path.exists(output_csv_path):
+        try:
+            df = pd.read_csv(output_csv_path, dtype=str)
+            if 'numero_del_dua' in df.columns:
+                with PROCESSED_DUAS_LOCK:
+                    for dua in df['numero_del_dua'].dropna():
+                        PROCESSED_DUAS.add(dua.strip())
+            logging.info(f"Se cargaron {len(PROCESSED_DUAS)} DUAs ya procesados desde {output_csv_path}.")
+        except Exception as e:
+            logging.error(f"No se pudo cargar DUAs previos desde {output_csv_path}: {e}")
