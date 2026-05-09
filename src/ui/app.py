@@ -9,7 +9,6 @@ import os
 import sys
 import threading
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 import tkinter as tk
@@ -25,7 +24,7 @@ from utils import (
     compute_output_paths, get_extracted_path,
     normalize_key, setup_logging, get_names_path,
 )
-from core.http_processor import HttpDUAProcessor, load_processed_duas_from_log
+from core.playwright_processor import PlaywrightDUAProcessor, load_processed_duas_from_log
 from flows.detalles_flow import DetallesFlow
 
 
@@ -68,7 +67,6 @@ class App(tk.Tk):
 
         self._names_df = None
         self._stop_event = threading.Event()
-        self._lock = threading.Lock()
         self._stats = {'success': 0, 'failed': 0, 'skipped': 0, 'total': 0}
         self._last_saved_index = -1  # mayor índice confirmado en sesión
         self._resume_from = -1       # índice de inicio de la ejecución actual
@@ -206,12 +204,26 @@ class App(tk.Tk):
             spin.grid(row=row_i, column=1, sticky='w', padx=8, pady=3)
 
             descs = {
-                'cant_hilos':  "Hilos HTTP paralelos. Sin navegador — puede subir a 5-10 sin problema.",
-                'timeout':     "Segundos de espera máxima por request HTTP.",
+                'cant_hilos':  "Contextos Playwright paralelos. Un proceso Chromium compartido — puede subir a 5-10.",
+                'timeout':     "Segundos de espera máxima por elemento o navegación.",
                 'max_retries': "Veces que se reintenta un DUA antes de marcarlo como fallido.",
             }
             ttk.Label(proc_frame, text=descs[key],
                       foreground='gray').grid(row=row_i, column=2, sticky='w', padx=8)
+
+        # Modo headless
+        next_row = len(params)
+        self._headless_var = tk.BooleanVar(value=bool(self.machine.get('headless', True)))
+        ttk.Checkbutton(
+            proc_frame,
+            text="Ocultar ventana del navegador (modo headless)",
+            variable=self._headless_var,
+        ).grid(row=next_row, column=0, columnspan=3, sticky='w', pady=(8, 2))
+        ttk.Label(
+            proc_frame,
+            text="Desactivar para depurar — ver el browser en tiempo real.",
+            foreground='gray',
+        ).grid(row=next_row + 1, column=0, columnspan=3, sticky='w', padx=4)
 
         # ── Rutas ─────────────────────────────────────────────────────────
         paths_frame = ttk.LabelFrame(parent, text=" Rutas ", padding=10)
@@ -396,6 +408,7 @@ class App(tk.Tk):
         for key, var in self._path_vars.items():
             self.machine[key] = var.get().strip()
 
+        self.machine['headless'] = bool(self._headless_var.get())
         save_machine_config(self.machine)
 
         self._cfg_saved_label.config(text="✓ Guardado")
@@ -529,40 +542,15 @@ class App(tk.Tk):
     # ═════════════════════════════════════════════════════════════════════════
 
     def _run(self, df: pd.DataFrame, output_paths: dict, start_from: int):
-        n_workers = self.machine.get('cant_hilos', 1)
-        flow = DetallesFlow()
-        processors = [
-            HttpDUAProcessor(
-                self.machine, output_paths, flow,
-                self._names_df, self._lock, self._stop_event,
-            )
-            for _ in range(n_workers)
-        ]
+        processor = PlaywrightDUAProcessor(
+            self.machine, output_paths, DetallesFlow(),
+            self._names_df, self._stop_event,
+        )
         try:
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                futures = []
-                skipped_count = 0
-                for idx, row in df.iterrows():
-                    if self._stop_event.is_set():
-                        break
-                    if idx <= start_from:
-                        skipped_count += 1
-                        continue
-                    if skipped_count > 0:
-                        logging.info("Saltadas %d filas ya procesadas (índices 0–%d).",
-                                     skipped_count, start_from)
-                        skipped_count = 0
-                    proc = processors[idx % n_workers]
-                    futures.append(
-                        executor.submit(proc.process_dua, idx, row, self._on_progress)
-                    )
-                for f in futures:
-                    f.result()
+            processor.run(df, start_from, self._on_progress)
         except Exception as e:
             logging.exception("Error en la ejecución principal: %s", e)
         finally:
-            for p in processors:
-                p.close()
             self.after(0, self._on_finished)
 
     # ═════════════════════════════════════════════════════════════════════════

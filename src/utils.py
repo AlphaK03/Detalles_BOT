@@ -30,6 +30,7 @@ _DEFAULT_MACHINE = {
     "max_retries":      3,
     "timeout":          10,
     "cant_hilos":       1,
+    "headless":         True,
 }
 
 _DEFAULT_SESSION = {
