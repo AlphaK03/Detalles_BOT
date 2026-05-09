@@ -25,12 +25,8 @@ from utils import (
     compute_output_paths, get_extracted_path,
     normalize_key, setup_logging, get_names_path,
 )
-from core.processor import DUAProcessor, load_processed_duas_from_log
+from core.http_processor import HttpDUAProcessor, load_processed_duas_from_log
 from flows.detalles_flow import DetallesFlow
-from driver_updater import (
-    get_edge_version, get_current_driver_version,
-    download_driver, DEST_DIR, DEST_FILE,
-)
 
 
 # ── Logging handler ───────────────────────────────────────────────────────────
@@ -195,7 +191,7 @@ class App(tk.Tk):
         proc_frame.columnconfigure(1, weight=1)
 
         params = [
-            ("Cantidad de hilos:",  'cant_hilos',  1,  10, 1),
+            ("Cantidad de hilos:",  'cant_hilos',  1,  20, 1),
             ("Timeout (segundos):", 'timeout',     5,  120, 10),
             ("Máx. reintentos:",    'max_retries', 1,  10, 3),
         ]
@@ -210,26 +206,12 @@ class App(tk.Tk):
             spin.grid(row=row_i, column=1, sticky='w', padx=8, pady=3)
 
             descs = {
-                'cant_hilos':  "Número de navegadores en paralelo. Recomendado: 1.",
-                'timeout':     "Segundos de espera máxima por elemento en la página.",
+                'cant_hilos':  "Hilos HTTP paralelos. Sin navegador — puede subir a 5-10 sin problema.",
+                'timeout':     "Segundos de espera máxima por request HTTP.",
                 'max_retries': "Veces que se reintenta un DUA antes de marcarlo como fallido.",
             }
             ttk.Label(proc_frame, text=descs[key],
                       foreground='gray').grid(row=row_i, column=2, sticky='w', padx=8)
-
-        # Modo sin ventana (headless)
-        next_row = len(params)
-        self._headless_var = tk.BooleanVar(value=bool(self.machine.get('headless', False)))
-        ttk.Checkbutton(
-            proc_frame,
-            text="Ocultar ventana del navegador (modo headless)",
-            variable=self._headless_var,
-        ).grid(row=next_row, column=0, columnspan=3, sticky='w', pady=(8, 2))
-        ttk.Label(
-            proc_frame,
-            text="Si está activo, el navegador corre en segundo plano sin mostrarse en pantalla.",
-            foreground='gray',
-        ).grid(row=next_row + 1, column=0, columnspan=3, sticky='w', padx=4)
 
         # ── Rutas ─────────────────────────────────────────────────────────
         paths_frame = ttk.LabelFrame(parent, text=" Rutas ", padding=10)
@@ -237,10 +219,8 @@ class App(tk.Tk):
         paths_frame.columnconfigure(1, weight=1)
 
         path_rows = [
-            ("Carpeta de salida:",    'output_base_path', 'folder',
+            ("Carpeta de salida:", 'output_base_path', 'folder',
              "Donde se guardan los CSV y archivos de DUAs fallidas."),
-            ("Ruta del WebDriver:",  'edge_driver_path', 'file',
-             "Ejecutable msedgedriver.exe para controlar Edge."),
         ]
         self._path_vars = {}
         for row_i, (label, key, kind, desc) in enumerate(path_rows):
@@ -263,21 +243,6 @@ class App(tk.Tk):
             ttk.Label(paths_frame, text=desc, foreground='gray').grid(
                 row=row_i * 2 + 1, column=1, columnspan=2,
                 sticky='w', padx=6, pady=(0, 2))
-
-        # ── Driver ────────────────────────────────────────────────────────
-        driver_frame = ttk.LabelFrame(parent, text=" WebDriver ", padding=10)
-        driver_frame.pack(fill='x', pady=(0, 8))
-
-        self._driver_info_var = tk.StringVar(value="Haga clic en 'Verificar' para comprobar versiones.")
-        ttk.Label(driver_frame, textvariable=self._driver_info_var,
-                  justify='left').pack(anchor='w')
-
-        driver_btns = ttk.Frame(driver_frame)
-        driver_btns.pack(anchor='w', pady=(6, 0))
-        ttk.Button(driver_btns, text="Verificar versiones",
-                   command=self._check_driver_versions).pack(side='left')
-        ttk.Button(driver_btns, text="Actualizar Driver…",
-                   command=self._show_driver_dialog).pack(side='left', padx=(8, 0))
 
         # ── Botón guardar ─────────────────────────────────────────────────
         save_row = ttk.Frame(parent)
@@ -431,8 +396,6 @@ class App(tk.Tk):
         for key, var in self._path_vars.items():
             self.machine[key] = var.get().strip()
 
-        self.machine['headless'] = bool(self._headless_var.get())
-
         save_machine_config(self.machine)
 
         self._cfg_saved_label.config(text="✓ Guardado")
@@ -569,7 +532,7 @@ class App(tk.Tk):
         n_workers = self.machine.get('cant_hilos', 1)
         flow = DetallesFlow()
         processors = [
-            DUAProcessor(
+            HttpDUAProcessor(
                 self.machine, output_paths, flow,
                 self._names_df, self._lock, self._stop_event,
             )
@@ -672,98 +635,6 @@ class App(tk.Tk):
                   f"Error {s['failed']}   "
                   f"Omitidos {s['skipped']}")
         )
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # Driver
-    # ═════════════════════════════════════════════════════════════════════════
-
-    def _check_driver_versions(self):
-        driver_path = self.machine.get('edge_driver_path',
-                                        os.path.join(DEST_DIR, DEST_FILE))
-        try:
-            edge_ver   = get_edge_version()
-            driver_ver = get_current_driver_version(driver_path) or "No instalado"
-            match      = (edge_ver == driver_ver)
-            icon       = "✓" if match else "⚠"
-            status     = "Versiones coinciden." if match else "Versiones NO coinciden — se recomienda actualizar."
-            self._driver_info_var.set(
-                f"Edge instalado: {edge_ver}   |   Driver actual: {driver_ver}\n{icon} {status}"
-            )
-        except RuntimeError as e:
-            self._driver_info_var.set(f"Error: {e}")
-
-    def _show_driver_dialog(self):
-        driver_path = self.machine.get('edge_driver_path',
-                                       os.path.join(DEST_DIR, DEST_FILE))
-        dlg = tk.Toplevel(self)
-        dlg.title("Actualizar WebDriver")
-        dlg.resizable(False, False)
-        dlg.grab_set()
-
-        try:
-            edge_ver = get_edge_version()
-        except RuntimeError as e:
-            messagebox.showerror("Error", str(e), parent=dlg)
-            dlg.destroy()
-            return
-
-        driver_ver = get_current_driver_version(driver_path) or "No instalado"
-        match = (edge_ver == driver_ver)
-
-        ttk.Label(
-            dlg,
-            text=(f"Edge instalado :  {edge_ver}\n"
-                  f"Driver actual  :  {driver_ver}\n\n"
-                  + ("Las versiones coinciden, no es necesario actualizar."
-                     if match else
-                     "Las versiones no coinciden. Se recomienda actualizar.")),
-            padding=14, justify='left', font=('Segoe UI', 9),
-        ).pack()
-
-        pbar = ttk.Progressbar(dlg, length=380, maximum=100)
-        pbar.pack(padx=14, pady=(0, 4))
-        kb_label = ttk.Label(dlg, text="")
-        kb_label.pack(pady=(0, 6))
-
-        btn_row = ttk.Frame(dlg, padding=(14, 0, 14, 14))
-        btn_row.pack()
-
-        def _do_update():
-            update_btn.config(state='disabled')
-            close_btn.config(state='disabled')
-
-            def _progress(pct: float, kb: int):
-                def _upd():
-                    pbar.config(value=pct)
-                    kb_label.config(text=f"{kb} KB descargados ({pct:.0f}%)")
-
-                dlg.after(0, _upd)
-
-            def _download():
-                try:
-                    download_driver(edge_ver, os.path.dirname(driver_path), _progress)
-                    self.machine['edge_driver_path'] = driver_path
-                    save_machine_config(self.machine)
-                    self._path_vars['edge_driver_path'].set(driver_path)
-                    dlg.after(0, lambda: messagebox.showinfo(
-                        "Listo", f"Driver actualizado a la version {edge_ver}.", parent=dlg))
-                    logging.info("Driver actualizado a %s.", edge_ver)
-                except RuntimeError as exc:
-                    err_msg = str(exc)
-                    dlg.after(0, lambda msg=err_msg: messagebox.showerror(
-                        "Error al descargar", msg, parent=dlg))
-                finally:
-                    dlg.after(0, lambda: (
-                        update_btn.config(state='normal'),
-                        close_btn.config(state='normal'),
-                    ))
-
-            threading.Thread(target=_download, daemon=True).start()
-
-        update_btn = ttk.Button(btn_row, text="Actualizar ahora", command=_do_update)
-        update_btn.pack(side='left', padx=5)
-        close_btn = ttk.Button(btn_row, text="Cerrar", command=dlg.destroy)
-        close_btn.pack(side='left', padx=5)
 
     def _reset_session(self):
         if not messagebox.askyesno(
