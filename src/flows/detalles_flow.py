@@ -1,7 +1,7 @@
 """detalles_flow.py — Flujo para consultar el DETALLE de una DUA en el portal TICA.
 
 Implementa BaseFlow para la URL:
-    https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx
+    https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx
 
 Navegación:
   1. Formulario principal (Aduana / Año / Número / CAPTCHA) → click DETALLE
@@ -23,7 +23,7 @@ from flows.base_flow import BaseFlow
 
 class DetallesFlow(BaseFlow):
 
-    _START_URL = 'https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx'
+    _START_URL = 'https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx'
 
     @property
     def start_url(self) -> str:

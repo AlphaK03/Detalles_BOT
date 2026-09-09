@@ -22,7 +22,8 @@ from playwright.async_api import async_playwright, Browser, Page
 
 from flows.base_flow import BaseFlow
 
-_PORTAL_BASE = 'https://portaltica.hacienda.go.cr'
+_PORTAL_BASE = 'https://ticaconsultas.hacienda.go.cr'
+_FORM_URL = f'{_PORTAL_BASE}/Tica/hcimppon.aspx'
 
 _PROCESSED_DUAS: set = set()
 
@@ -40,6 +41,13 @@ def load_processed_duas_from_log(log_path: str) -> None:
         logging.info("Cargados %d DUAs previos desde %s.", len(_PROCESSED_DUAS), log_path)
     except Exception as e:
         logging.error("No se pudo cargar DUAs previos: %s", e)
+
+
+_PORTAL_DOWN_SIGNALS = (
+    'ERR_NAME_NOT_RESOLVED',
+    'ERR_INTERNET_DISCONNECTED',
+    'ERR_CONNECTION_REFUSED',
+)
 
 
 class PlaywrightDUAProcessor:
@@ -61,6 +69,9 @@ class PlaywrightDUAProcessor:
         self._flow = flow
         self.names_df = names_df
         self.stop_event = stop_event
+        # Coordinación de caída del portal entre workers
+        self._portal_available: asyncio.Event | None = None
+        self._portal_check_lock: asyncio.Lock | None = None
 
     # ── API pública ──────────────────────────────────────────────────────────
 
@@ -75,8 +86,17 @@ class PlaywrightDUAProcessor:
     ) -> None:
         n_workers = self.machine.get('cant_hilos', 1)
         headless = self.machine.get('headless', True)
+
+        import sys
+        if getattr(sys, 'frozen', False):
+            local_appdata = os.environ.get('LOCALAPPDATA', '')
+            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(local_appdata, 'ms-playwright')
+
         io_lock  = asyncio.Lock()
         dup_lock = asyncio.Lock()
+        self._portal_available = asyncio.Event()
+        self._portal_available.set()
+        self._portal_check_lock = asyncio.Lock()
 
         # Cola con los índices pendientes (memory-efficient para 70K+ filas)
         queue: asyncio.Queue = asyncio.Queue()
@@ -121,10 +141,18 @@ class PlaywrightDUAProcessor:
     ) -> None:
         dua_number = row['NroDUA']
         max_retries = self.machine['max_retries']
+        attempt = 0
 
-        for attempt in range(1, max_retries + 1):
+        while attempt < max_retries:
             if self.stop_event.is_set():
                 return
+
+            # Si el portal está caído, esperar antes de intentar
+            if not self._portal_available.is_set():
+                await self._portal_available.wait()
+                if self.stop_event.is_set():
+                    return
+
             context = await browser.new_context()
             try:
                 page = await context.new_page()
@@ -152,8 +180,16 @@ class PlaywrightDUAProcessor:
                 return
 
             except Exception as e:
-                logging.warning("[%s] Intento %d/%d: %s: %s",
-                                dua_number, attempt, max_retries, type(e).__name__, e)
+                error_str = str(e)
+                if any(sig in error_str for sig in _PORTAL_DOWN_SIGNALS):
+                    # Error de red global: no gastar reintento, esperar reconexión
+                    logging.warning("[%s] Portal no disponible (%s). Pausando...",
+                                    dua_number, next(s for s in _PORTAL_DOWN_SIGNALS if s in error_str))
+                    await self._trigger_portal_wait()
+                else:
+                    attempt += 1
+                    logging.warning("[%s] Intento %d/%d: %s: %s",
+                                    dua_number, attempt, max_retries, type(e).__name__, e)
             finally:
                 await context.close()
 
@@ -161,18 +197,51 @@ class PlaywrightDUAProcessor:
         self._log_failed(dua_number)
         progress_callback(idx, 'failed')
 
+    async def _trigger_portal_wait(self) -> None:
+        """
+        El primer worker en detectar la caída lanza el polling;
+        los demás simplemente esperan el evento.
+        """
+        async with self._portal_check_lock:
+            if self._portal_available.is_set():
+                # Somos los primeros: bajar la bandera y lanzar recovery
+                self._portal_available.clear()
+                asyncio.ensure_future(self._portal_recovery_task())
+        # Todos (incluyendo quien lanzó el recovery) esperan aquí
+        await self._portal_available.wait()
+
+    async def _portal_recovery_task(self) -> None:
+        """Polling cada 10 s hasta que el portal responda. Desbloquea _portal_available."""
+        import requests as _requests
+        url = _FORM_URL
+        logging.info("Portal caído. Polling cada 10 s hasta reconexión...")
+        while not self.stop_event.is_set():
+            try:
+                resp = await asyncio.to_thread(
+                    _requests.get, url, timeout=10, verify=False
+                )
+                if resp.status_code < 500:
+                    logging.info("Portal en línea nuevamente. Reanudando procesamiento.")
+                    self._portal_available.set()
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(10)
+        # Si se detuvo el bot, desbloquear workers para que salgan limpiamente
+        self._portal_available.set()
+
     async def _fetch_result(self, page: Page, row) -> str:
         timeout_ms = self.machine['timeout'] * 1000
-        start_url  = f'{_PORTAL_BASE}/TicaExterno/hcimppon.aspx'
+        start_url = _FORM_URL
 
-        await page.goto(start_url, timeout=timeout_ms)
+        await page.goto(start_url, timeout=timeout_ms, wait_until='domcontentloaded')
 
         # Descartar página de rectificación si el portal la muestra
         salir = page.locator('input[name="SALIR"][value="OK"]')
         if await salir.count() > 0:
             logging.info("Página de rectificación detectada. Descartando...")
             await salir.click()
-            await page.wait_for_load_state('networkidle', timeout=timeout_ms)
+            await page.wait_for_load_state('domcontentloaded', timeout=timeout_ms)
 
         captcha_text = await self._resolve_captcha(page, timeout_ms)
 
