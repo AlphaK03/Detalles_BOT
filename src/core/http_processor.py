@@ -17,8 +17,8 @@ from bs4 import BeautifulSoup
 
 from flows.base_flow import BaseFlow
 
-_PORTAL_BASE = 'https://portaltica.hacienda.go.cr'
-_FORM_URL    = f'{_PORTAL_BASE}/TicaExterno/hcimppon.aspx'
+_PORTAL_BASE = 'https://ticaconsultas.hacienda.go.cr'
+_FORM_URL    = f'{_PORTAL_BASE}/Tica/hcimppon.aspx'
 
 _HEADERS = {
     'User-Agent': (
@@ -26,7 +26,11 @@ _HEADERS = {
         'AppleWebKit/537.36 (KHTML, like Gecko) '
         'Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0'
     ),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'es-CR,es;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
 }
 
 _PROCESSED_DUAS = set()
@@ -140,6 +144,15 @@ class HttpDUAProcessor:
 
         resp = self._session.get(_FORM_URL, timeout=timeout)
         resp.raise_for_status()
+        logging.debug("GET %s → %s", _FORM_URL, resp.url)
+        # Volcado único para diagnóstico — eliminar una vez resuelto el CAPTCHA
+        _dump_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                                  'logs', 'debug_html.html')
+        if not os.path.exists(_dump_path):
+            os.makedirs(os.path.dirname(_dump_path), exist_ok=True)
+            with open(_dump_path, 'w', encoding='utf-8') as _f:
+                _f.write(resp.text)
+            logging.info("HTML volcado en: %s", _dump_path)
         soup = BeautifulSoup(resp.text, 'html.parser')
 
         # El portal a veces muestra una página de rectificación antes del formulario
@@ -184,18 +197,31 @@ class HttpDUAProcessor:
         return payload
 
     def _resolve_captcha(self, soup: BeautifulSoup) -> str:
-        """Extrae la URL de la imagen del CAPTCHA y la resuelve por lookup."""
+        """Extrae el número de imagen del CAPTCHA y lo resuelve por lookup."""
+        import re as _re
+
+        captcha_url = None
+
+        # Estrategia 1: div#captchaImage img (presente en el DOM del browser tras ejecutar JS)
         div = soup.find('div', {'id': 'captchaImage'})
-        if not div:
-            raise ValueError("No se encontró div#captchaImage en la página.")
-        img = div.find('img')
-        if not img:
-            raise ValueError("No se encontró la imagen del CAPTCHA.")
-        # urljoin garantiza URL absoluta igual a la que Selenium producía
-        url = urljoin(_PORTAL_BASE, img.get('src', ''))
-        matches = self.names_df.loc[self.names_df['Path'] == url, 'Word'].values
+        if div:
+            img = div.find('img')
+            if img:
+                captcha_url = urljoin(_PORTAL_BASE, img.get('src', ''))
+
+        # Estrategia 2: buscar el patrón /Captcha/images/N.jpg en todo el HTML
+        # (puede estar en un <script>, data-attr, o referencia oculta)
+        if not captcha_url:
+            m = _re.search(r'Captcha/images/(\d+)\.jpg', str(soup), _re.I)
+            if m:
+                captcha_url = f"{_PORTAL_BASE}/Tica/Captcha/images/{m.group(1)}.jpg"
+
+        if not captcha_url:
+            raise ValueError("No se encontró la URL del CAPTCHA en el HTML de la página.")
+
+        matches = self.names_df.loc[self.names_df['Path'] == captcha_url, 'Word'].values
         if len(matches) == 0:
-            raise ValueError(f"CAPTCHA no encontrado en lookup: {url}")
+            raise ValueError(f"CAPTCHA no encontrado en lookup: {captcha_url}")
         return str(matches[0])
 
     def _validate(self, data: pd.DataFrame, dua_number: str) -> None:

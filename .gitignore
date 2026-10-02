@@ -21,6 +21,7 @@ src/logs/
 # Datos de sesión y caché local
 config/session.json
 src/data/Datos_Cargados/
+data/Datos_Cargados/
 
 # Archivos de datos grandes (no versionables)
 Names_TicaPortal.xlsx

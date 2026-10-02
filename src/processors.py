@@ -121,14 +121,14 @@ class DUAProcessor:
                 try:
                     # Volver a la página principal
                     try:
-                        self.driver.get('https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx')
+                        self.driver.get('https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx')
                     except WebDriverException as e:
                         if "ERR_NAME_NOT_RESOLVED" in str(e):
                             logging.warning("Error DNS: página no disponible. Esperando disponibilidad...")
-                            esperar_disponibilidad_pagina("https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx",
+                            esperar_disponibilidad_pagina("https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx",
                                                           intervalo=10)
                             try:
-                                self.driver.get('https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx')
+                                self.driver.get('https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx')
                             except Exception as e2:
                                 logging.error(f"No se pudo cargar la página tras la espera: {e2}")
                                 self.log_failed_dua(dua_number)
@@ -222,7 +222,7 @@ class DUAProcessor:
                 self.log_failed_dua(row['numero_del_dua'])
 
             # Regresar a la página principal para el siguiente DUA
-            self.driver.get('https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx')
+            self.driver.get('https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx')
         except Exception as e:
             logging.exception(f"Error general al procesar DUA {dua_number}: {e}")
 
@@ -236,7 +236,7 @@ class DUAProcessor:
             while retries < max_retries and not self.stop_event.is_set():
                 try:
                     # Navegar a la página principal
-                    self.driver.get('https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx')
+                    self.driver.get('https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx')
                     #time.sleep(2)  # <-- Nueva pausa de 2s
                     # Establecer el zoom de la página al 25%
                     set_zoom_level(self.driver, 25)
@@ -285,7 +285,7 @@ class DUAProcessor:
                 except WebDriverException as e:
                     if "ERR_NAME_NOT_RESOLVED" in str(e):
                         logging.warning("Error DNS: página no disponible. Esperando disponibilidad...")
-                        esperar_disponibilidad_pagina("https://portaltica.hacienda.go.cr/TicaExterno/hcimppon.aspx",
+                        esperar_disponibilidad_pagina("https://ticaconsultas.hacienda.go.cr/Tica/hcimppon.aspx",
                                                       intervalo=10)
                         continue
                     retries += 1

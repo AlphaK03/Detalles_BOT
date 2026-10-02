@@ -1,34 +1,42 @@
-import os
 import pandas as pd
+from tkinter import filedialog
+from tkinter import Tk
 
-# Obtener la ruta del directorio actual donde está el script
-current_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Ruta del archivo CSV que contiene las DUAs generadas
-csv_file_path = os.path.join(current_dir, "duas_coincidentes_abril.csv")  # Cambia el nombre según el archivo generado
+# Función para seleccionar el archivo .xlsx
+def seleccionar_archivo():
+    root = Tk()
+    root.withdraw()  # Ocultar la ventana principal de Tkinter
+    archivo = filedialog.askopenfilename(title="Selecciona un archivo Excel", filetypes=[("Archivos Excel", "*.xlsx")])
+    return archivo
 
-# Cargar el archivo CSV
-df_duas = pd.read_csv(csv_file_path)
 
-# Eliminar la primera columna (índice) del DataFrame para no incluirla en la comparación
-df_duas_without_index = df_duas.iloc[:, 1:]
+# Función principal
+def encontrar_duplicados():
+    archivo = seleccionar_archivo()
 
-# Identificar las filas duplicadas ignorando la primera columna (índice)
-df_duplicated = df_duas[df_duas_without_index.duplicated(keep=False)]
+    if archivo:
+        df = pd.read_excel(archivo)
 
-# Eliminar duplicados ignorando la primera columna (mantener la primera aparición)
-df_duas_no_duplicates = df_duas.drop_duplicates(subset=df_duas.columns[1:], keep='first')
+        # 📌 Imprimir los nombres de las columnas para verificar
+        print("Columnas en el archivo:", df.columns.tolist())
 
-# Guardar el archivo sin duplicados
-output_file_path_no_duplicates = os.path.join(current_dir, "duas_restantes_abril.csv")
-df_duas_no_duplicates.to_csv(output_file_path_no_duplicates, index=False)
+        # Buscar el nombre correcto de la columna (sin espacios extra)
+        columnas_procesadas = [col.strip() for col in df.columns]
+        df.columns = columnas_procesadas  # Limpiar nombres de columnas
 
-# Guardar los duplicados en un archivo aparte
-output_file_path_duplicates = os.path.join(current_dir, "duas_duplicadas_abril.csv")
-df_duplicated.to_csv(output_file_path_duplicates, index=False)
+        if 'numero_del_dua' in df.columns:
+            duplicados = df[df.duplicated(subset='numero_del_dua', keep=False)]
+            if not duplicados.empty:
+                print("Filas con 'numero_del_dua' duplicados:")
+                print(duplicados)
+            else:
+                print("No se encontraron duplicados.")
+        else:
+            print("No se encuentra la columna 'numero_del_dua'. Verifique los nombres en el archivo.")
+    else:
+        print("No se seleccionó ningún archivo.")
 
-# Mostrar cuántas filas duplicadas se eliminaron y se guardaron
-duplicates_count = df_duplicated.shape[0]
-print(f"Se encontraron {duplicates_count} filas duplicadas ignorando la primera columna.")
-print(f"Las filas duplicadas se han guardado en {output_file_path_duplicates}.")
-print(f"El archivo sin duplicados se ha guardado en {output_file_path_no_duplicates}.")
+
+if __name__ == "__main__":
+    encontrar_duplicados()

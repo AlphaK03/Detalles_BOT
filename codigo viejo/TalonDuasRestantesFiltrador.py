@@ -1,14 +1,14 @@
 import pandas as pd
 
-# Cargar el archivo de Excel con la columna 'NroDUA'
-excel_path = r'C:/Users/keylo/CHC Consultores/CHC-CONSULTORES - Automatizacion TICA/Datos_Generales/DUAs/Total_DUAS - Import.xlsx'
-df_total_duas = pd.read_excel(excel_path, sheet_name='octubre24')
+# Rutas de los archivos de Excel
+excel_path_total_duas = r'C:/Users/keylo/CHC Consultores/CHC-CONSULTORES - Automatizacion TICA/Datos_Generales/DUAs/Total_DUAS.xlsx'
+excel_path_duas_procesados = r'C:/Users/keylo/CHC Consultores/CHC-CONSULTORES - Automatizacion TICA/Datos_Generales/Datos_Procesados/DetalleFixed_BOT/enero25/012025_detalle_DUAs_enero25.xlsx'
 
-# Cargar el archivo CSV con la columna 'numero_del_dua', omitiendo filas problemáticas
-csv_path = r'C:/Users/keylo/CHC Consultores/CHC-CONSULTORES - Automatizacion TICA/Datos_Generales/Datos_Procesados/Talon_BOT/octubre24/Duas_procesados_octubre24.csv'
-df_duas_procesados = pd.read_csv(csv_path, on_bad_lines='skip')
+# Cargar los archivos de Excel
+df_total_duas = pd.read_excel(excel_path_total_duas, sheet_name='enero25')
+df_duas_procesados = pd.read_excel(excel_path_duas_procesados, sheet_name='enero25')  # Ajusta el nombre de la hoja si es necesario
 
-# Extraer las columnas relevantes
+# Extraer las columnas relevantes y convertir a string
 nro_dua_values = df_total_duas['NroDUA'].astype(str)
 numero_del_dua_values = df_duas_procesados['numero_del_dua'].astype(str)
 
@@ -16,7 +16,7 @@ numero_del_dua_values = df_duas_procesados['numero_del_dua'].astype(str)
 duas_fallidas = df_total_duas[~nro_dua_values.isin(numero_del_dua_values)]
 
 # Guardar los valores faltantes en un nuevo archivo de Excel
-output_path = r'C:/Users/keylo/CHC Consultores/CHC-CONSULTORES - Automatizacion TICA/Datos_Generales/DUAs/Total_DUAS - Import_octubre24.xlsx'
+output_path = r'C:/Users/keylo/CHC Consultores/CHC-CONSULTORES - Automatizacion TICA/Datos_Generales/DUAs/Total_DUAS_enero25.xlsx'
 with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
     duas_fallidas.to_excel(writer, index=False, sheet_name='DUAs_Fallidas')
 

@@ -149,7 +149,7 @@ Solo se instala Chromium (111 MB). No se necesita msedgedriver ni ningún binari
 
 ## Cómo aplicar a un bot nuevo
 
-Un bot nuevo de la familia TICA solo necesita cambiar `DetallesFlow`. El processor y la UI son idénticos.
+Un bot nuevo de la familia TICA solo necesita cambiar `DetallesFlow` o equivalente flow. El processor y la UI son idénticos.
 
 ### Paso 1 — Crear el flujo del nuevo bot
 
