@@ -1,295 +1,247 @@
-"""playwright_processor.py — Motor Playwright de procesamiento de DUAs.
-
-Un solo proceso Chromium compartido con N contextos aislados concurrentes:
-  - Playwright carga el form y ejecuta JS → GeneXus rellena div#captchaImage
-  - Lookup en names_df por URL de imagen (sin descargar nada)
-  - Click DETALLE → redirect a hcimdpola.aspx → wait_for_selector span_CODI_ADUAN
-  - extract_data() de DetallesFlow reutilizado sin cambios
-
-Comparado con Selenium:
-  - 1 proceso Chromium vs N procesos Edge
-  - ~30 MB por contexto vs ~300 MB por instancia Edge
-"""
-import os
+"""Navegación concurrente con cola durable y reintentos por rondas completas."""
 import asyncio
 import logging
+import os
+import sys
+import time
+import json
+from pathlib import Path
 from threading import Event
-from typing import Callable
 from urllib.parse import urljoin
 
-import pandas as pd
-from playwright.async_api import async_playwright, Browser, Page
+from playwright.async_api import async_playwright, Page
 
-from flows.base_flow import BaseFlow
-
-_PORTAL_BASE = 'https://ticaconsultas.hacienda.go.cr'
-_FORM_URL = f'{_PORTAL_BASE}/Tica/hcimppon.aspx'
-
-_PROCESSED_DUAS: set = set()
+from core.captcha import resolve_captcha
+from core.identifiers import dua_fields, validate_result
+from core.portal_form import fill_and_submit, wait_form_ready
+from core.messages import pending_reason
+from core.detail_navigation import install_lightweight_detail
 
 
-def load_processed_duas_from_log(log_path: str) -> None:
-    """Pre-carga DUAs ya procesados. Llamar antes de iniciar el procesamiento."""
-    if not os.path.exists(log_path):
-        return
-    try:
-        with open(log_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                dua = line.strip()
-                if dua:
-                    _PROCESSED_DUAS.add(dua)
-        logging.info("Cargados %d DUAs previos desde %s.", len(_PROCESSED_DUAS), log_path)
-    except Exception as e:
-        logging.error("No se pudo cargar DUAs previos: %s", e)
-
-
-_PORTAL_DOWN_SIGNALS = (
-    'ERR_NAME_NOT_RESOLVED',
-    'ERR_INTERNET_DISCONNECTED',
-    'ERR_CONNECTION_REFUSED',
-)
+class ExtraStepRequired(RuntimeError):
+    """Caso reservado para diagnóstico posterior; no se hace el clic adicional."""
 
 
 class PlaywrightDUAProcessor:
-    """
-    Procesa DUAs usando un browser Chromium compartido con contextos aislados.
-    Diseñado para ser llamado desde un hilo worker (app._run).
-    """
-
-    def __init__(
-        self,
-        machine_config: dict,
-        output_paths: dict,
-        flow: BaseFlow,
-        names_df: pd.DataFrame,
-        stop_event: Event,
-    ):
-        self.machine = machine_config
+    def __init__(self, machine_config, output_paths, flow, captcha_lookup, stop_event: Event):
+        self.machine = dict(machine_config)
         self.output_paths = output_paths
         self._flow = flow
-        self.names_df = names_df
+        self.captcha_lookup = captcha_lookup
         self.stop_event = stop_event
-        # Coordinación de caída del portal entre workers
-        self._portal_available: asyncio.Event | None = None
-        self._portal_check_lock: asyncio.Lock | None = None
+        self.fields = list(flow.extract_data('').columns)
+        self._last_export = time.monotonic()
+        self._last_notification = 0.0
 
-    # ── API pública ──────────────────────────────────────────────────────────
+    def run(self, store, progress_callback):
+        for key, default in [('cant_hilos', 1), ('max_retries', 3), ('timeout', 30)]:
+            if int(self.machine.get(key, default)) < 1:
+                raise ValueError(f'{key} debe ser mayor que cero')
+        store.begin_run()
+        self._notify(store, progress_callback, force=True)
+        try:
+            asyncio.run(self._run_async(store, progress_callback))
+            summary = store.summary()
+            logging.info('%s %d DUAs guardados; %d pendientes.',
+                         'Proceso detenido.' if self.stop_event.is_set() else 'Consultas terminadas.',
+                         summary['succeeded'], summary['total'] - summary['succeeded'])
+        finally:
+            # Los resultados se confirmaron antes en SQLite; fallar aquí no los pierde.
+            store.export(self.output_paths, self.fields)
+            self._notify(store, progress_callback, force=True)
 
-    def run(self, df: pd.DataFrame, start_from: int, progress_callback: Callable) -> None:
-        """Entry point sincrónico — lanzado desde el hilo daemon de app._run()."""
-        asyncio.run(self._run_async(df, start_from, progress_callback))
-
-    # ── Motor async ──────────────────────────────────────────────────────────
-
-    async def _run_async(
-        self, df: pd.DataFrame, start_from: int, progress_callback: Callable
-    ) -> None:
-        n_workers = self.machine.get('cant_hilos', 1)
-        headless = self.machine.get('headless', True)
-
-        import sys
+    async def _run_async(self, store, callback):
+        summary = store.summary()
+        if self.stop_event.is_set() or summary['total'] == summary['succeeded'] + summary['invalid']:
+            return
         if getattr(sys, 'frozen', False):
-            local_appdata = os.environ.get('LOCALAPPDATA', '')
-            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(local_appdata, 'ms-playwright')
-
-        io_lock  = asyncio.Lock()
-        dup_lock = asyncio.Lock()
-        self._portal_available = asyncio.Event()
-        self._portal_available.set()
-        self._portal_check_lock = asyncio.Lock()
-
-        # Cola con los índices pendientes (memory-efficient para 70K+ filas)
-        queue: asyncio.Queue = asyncio.Queue()
-        skipped = 0
-        for idx, row in df.iterrows():
-            if idx <= start_from:
-                skipped += 1
-                continue
-            if skipped > 0:
-                logging.info("Saltadas %d filas ya procesadas (0–%d).", skipped, start_from)
-                skipped = 0
-            await queue.put((int(idx), row))
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=headless)
-            logging.info("Browser Chromium iniciado (headless=%s, workers=%d).", headless, n_workers)
-
-            workers = [
-                self._worker(queue, browser, io_lock, dup_lock, progress_callback)
-                for _ in range(n_workers)
-            ]
-            await asyncio.gather(*workers)
-            await browser.close()
-
-    async def _worker(
-        self, queue: asyncio.Queue, browser: Browser,
-        io_lock: asyncio.Lock, dup_lock: asyncio.Lock,
-        progress_callback: Callable,
-    ) -> None:
-        while not self.stop_event.is_set():
+            os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH',
+                                  os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ms-playwright'))
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=self.machine.get('headless', True))
             try:
-                idx, row = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            await self._process_dua(browser, io_lock, dup_lock, idx, row, progress_callback)
-            queue.task_done()
-
-    async def _process_dua(
-        self, browser: Browser,
-        io_lock: asyncio.Lock, dup_lock: asyncio.Lock,
-        idx: int, row, progress_callback: Callable,
-    ) -> None:
-        dua_number = row['NroDUA']
-        max_retries = self.machine['max_retries']
-        attempt = 0
-
-        while attempt < max_retries:
-            if self.stop_event.is_set():
-                return
-
-            # Si el portal está caído, esperar antes de intentar
-            if not self._portal_available.is_set():
-                await self._portal_available.wait()
-                if self.stop_event.is_set():
-                    return
-
-            context = await browser.new_context()
-            try:
-                page = await context.new_page()
-                await self._block_static(page)
-
-                html = await self._fetch_result(page, row)
-                data = self._flow.extract_data(html)
-                self._validate(data, dua_number)
-
-                extracted_dua = data.iloc[0]['numero_del_dua'].strip()
-
-                async with dup_lock:
-                    if extracted_dua in _PROCESSED_DUAS:
-                        logging.warning("DUA %s ya procesado. Omitido.", extracted_dua)
-                        progress_callback(idx, 'skipped')
-                        return
-                    _PROCESSED_DUAS.add(extracted_dua)
-
-                async with io_lock:
-                    self._write_csv(data)
-                    self._log_processed(extracted_dua)
-
-                logging.info("DUA %s guardado.", extracted_dua, extra={'tag': 'SUCCESS'})
-                progress_callback(idx, 'success')
-                return
-
-            except Exception as e:
-                error_str = str(e)
-                if any(sig in error_str for sig in _PORTAL_DOWN_SIGNALS):
-                    # Error de red global: no gastar reintento, esperar reconexión
-                    logging.warning("[%s] Portal no disponible (%s). Pausando...",
-                                    dua_number, next(s for s in _PORTAL_DOWN_SIGNALS if s in error_str))
-                    await self._trigger_portal_wait()
-                else:
-                    attempt += 1
-                    logging.warning("[%s] Intento %d/%d: %s: %s",
-                                    dua_number, attempt, max_retries, type(e).__name__, e)
+                for round_number in range(1, int(self.machine.get('max_retries', 3)) + 1):
+                    if self.stop_event.is_set():
+                        break
+                    logging.info('Consultando los DUAs pendientes.' if round_number == 1 else
+                                 'Reintentando automáticamente los DUAs que quedaron pendientes.')
+                    await self._run_round(store, browser, round_number, callback)
+                    summary = store.summary()
+                    if summary['succeeded'] + summary['invalid'] == summary['total']:
+                        break
+                    if round_number < int(self.machine.get('max_retries', 3)):
+                        await self._cooldown(min(2 ** round_number, 30))
             finally:
-                await context.close()
+                await browser.close()
 
-        logging.error("[%s] Reintentos agotados.", dua_number)
-        self._log_failed(dua_number)
-        progress_callback(idx, 'failed')
+    async def _run_round(self, store, browser, round_number, callback):
+        concurrency = int(self.machine.get('cant_hilos', 1))
+        if round_number > 1:
+            concurrency = min(concurrency, 2)
+        workers = [asyncio.create_task(self._worker(store, browser, round_number, callback))
+                   for _ in range(concurrency)]
+        group = asyncio.gather(*workers)
 
-    async def _trigger_portal_wait(self) -> None:
-        """
-        El primer worker en detectar la caída lanza el polling;
-        los demás simplemente esperan el evento.
-        """
-        async with self._portal_check_lock:
-            if self._portal_available.is_set():
-                # Somos los primeros: bajar la bandera y lanzar recovery
-                self._portal_available.clear()
-                asyncio.ensure_future(self._portal_recovery_task())
-        # Todos (incluyendo quien lanzó el recovery) esperan aquí
-        await self._portal_available.wait()
+        async def stopped():
+            while not self.stop_event.is_set():
+                await asyncio.sleep(0.1)
 
-    async def _portal_recovery_task(self) -> None:
-        """Polling cada 10 s hasta que el portal responda. Desbloquea _portal_available."""
-        import requests as _requests
-        url = _FORM_URL
-        logging.info("Portal caído. Polling cada 10 s hasta reconexión...")
-        while not self.stop_event.is_set():
-            try:
-                resp = await asyncio.to_thread(
-                    _requests.get, url, timeout=10, verify=False
-                )
-                if resp.status_code < 500:
-                    logging.info("Portal en línea nuevamente. Reanudando procesamiento.")
-                    self._portal_available.set()
+        watcher = asyncio.create_task(stopped())
+        try:
+            done, _ = await asyncio.wait([group, watcher], return_when=asyncio.FIRST_COMPLETED)
+            if watcher in done:
+                for worker in workers:
+                    worker.cancel()
+            await group
+        except asyncio.CancelledError:
+            if not self.stop_event.is_set():
+                raise
+        finally:
+            watcher.cancel()
+            for worker in workers:
+                if not worker.done():
+                    worker.cancel()
+            await asyncio.gather(*workers, watcher, return_exceptions=True)
+
+    async def _worker(self, store, browser, round_number, callback):
+        context = page = None
+        created, uses = 0.0, 0
+        reuse = bool(self.machine.get('reuse_context', True))
+        try:
+            while not self.stop_event.is_set():
+                job = store.claim(round_number)
+                if job is None:
                     return
-            except Exception:
-                pass
-            await asyncio.sleep(10)
-        # Si se detuvo el bot, desbloquear workers para que salgan limpiamente
-        self._portal_available.set()
+                resolved, discard = False, False
+                try:
+                    try:
+                        if context is None:
+                            context = await browser.new_context()
+                            page = await context.new_page()
+                            page.set_default_timeout(int(self.machine.get('timeout', 30)) * 1000)
+                            await self._block_static(page)
+                            created, uses = time.monotonic(), 0
+                        # Cada DUA vuelve al formulario y recibe un CAPTCHA nuevo.
+                        # La sesión nunca se comparte con otro trabajador.
+                        uses += 1
+                        html = await self._fetch_result(page, dua_fields(job['dua']))
+                        record = validate_result(self._flow.extract_data(html), job['dua'])
+                    except Exception as exc:
+                        discard = True
+                        evidence = await self._save_evidence(page, job['dua'])
+                        kind = 'extra_step' if isinstance(exc, ExtraStepRequired) else type(exc).__name__
+                        store.retry(job, exc, kind, evidence)
+                        resolved = True
+                        last_round = round_number >= int(self.machine.get('max_retries', 3))
+                        next_step = 'Queda guardado como pendiente.' if last_round else 'Se reintentará al final.'
+                        logging.warning('DUA %s: %s %s', job['dua'], pending_reason(kind, str(exc)), next_step)
+                        logging.warning('[%s] Ronda %d: %s: %s', job['dua'], round_number, kind, exc,
+                                        extra={'technical_only': True})
+                    else:
+                        # Los errores de disco siguen siendo fatales y no se reintentan como red.
+                        store.complete(job, record)
+                        resolved = True
+                        logging.info('DUA %s guardado.', job['dua'], extra={'tag': 'SUCCESS'})
+                    self._notify(store, callback)
+                    if time.monotonic() - self._last_export >= self.machine.get('export_interval', 60):
+                        store.export(self.output_paths, self.fields)
+                        self._last_export = time.monotonic()
+                finally:
+                    if not resolved:
+                        store.retry(job, 'Intento interrumpido; se retomará al iniciar.',
+                                    'interrupted', cancelled=True)
+                    if context is not None and (discard or not reuse or uses >= 100 or time.monotonic() - created >= 600):
+                        try:
+                            await context.close()
+                        except Exception:
+                            logging.debug('Contexto ya cerrado.', exc_info=True)
+                        finally:
+                            context = page = None
+        finally:
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    logging.debug('Contexto ya cerrado.', exc_info=True)
+
+    def _notify(self, store, callback, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_notification < 0.25:
+            return
+        self._last_notification = now
+        callback(store.summary())
+
+    async def _cooldown(self, seconds):
+        until = time.monotonic() + seconds
+        while not self.stop_event.is_set() and time.monotonic() < until:
+            await asyncio.sleep(0.1)
 
     async def _fetch_result(self, page: Page, row) -> str:
-        timeout_ms = self.machine['timeout'] * 1000
-        start_url = _FORM_URL
+        hook = None
+        page._dua_raw_detail = None
+        page._dua_form_snapshot = None
+        if self.machine.get('lightweight_details', True):
+            hook = await install_lightweight_detail(page, self._flow, row['NroDUA'],
+                                                    int(self.machine.get('timeout', 30)) * 1000)
+        try:
+            return await self._fetch_page_result(page, row)
+        finally:
+            if hook:
+                await page.unroute(*hook)
 
-        await page.goto(start_url, timeout=timeout_ms, wait_until='domcontentloaded')
-
-        # Descartar página de rectificación si el portal la muestra
-        salir = page.locator('input[name="SALIR"][value="OK"]')
-        if await salir.count() > 0:
-            logging.info("Página de rectificación detectada. Descartando...")
-            await salir.click()
-            await page.wait_for_load_state('domcontentloaded', timeout=timeout_ms)
-
+    async def _fetch_page_result(self, page: Page, row) -> str:
+        timeout_ms = int(self.machine.get('timeout', 30)) * 1000
+        page.set_default_timeout(timeout_ms)
+        response = await page.goto(self._flow.start_url, timeout=timeout_ms, wait_until='domcontentloaded')
+        if response and response.status >= 400:
+            raise RuntimeError(f'Portal respondió HTTP {response.status}')
+        extra = page.locator('input[name="SALIR"][value="OK"]')
+        if await extra.count():
+            raise ExtraStepRequired('Página intermedia: requiere clic adicional')
+        await wait_form_ready(page, timeout_ms)
         captcha_text = await self._resolve_captcha(page, timeout_ms)
+        try:
+            await fill_and_submit(page, row, captcha_text, timeout_ms,
+                                  captcha_source=page._dua_captcha_source)
+        except Exception:
+            if await extra.count():
+                raise ExtraStepRequired('El resultado requiere clic adicional') from None
+            raise
+        if await extra.count():
+            raise ExtraStepRequired('El resultado requiere clic adicional')
+        return page._dua_raw_detail or await page.content()
 
-        await page.fill('#vVCODI_ADUA', str(row['Aduana']))
-        await page.fill('#vVANO_PRE',   str(row['Año']))
-        await page.fill('#vVNUME_CORR', str(row['Número']))
-        await page.fill('#_cfield',     captcha_text)
-
-        await page.click('[name="DETALLE"]')
-        await page.wait_for_selector('#span_CODI_ADUAN', timeout=timeout_ms)
-
-        return await page.content()
-
-    async def _resolve_captcha(self, page: Page, timeout_ms: int) -> str:
-        # Esperar a que GeneXus JS inyecte la imagen en div#captchaImage
-        img = await page.wait_for_selector('#captchaImage img', timeout=timeout_ms)
+    async def _resolve_captcha(self, page, timeout_ms):
+        img = await page.wait_for_selector('#captchaImage img', state='attached', timeout=timeout_ms)
         src = await img.get_attribute('src')
-        url = urljoin(_PORTAL_BASE, src or '')
-        matches = self.names_df.loc[self.names_df['Path'] == url, 'Word'].values
-        if len(matches) == 0:
-            raise ValueError(f"CAPTCHA no encontrado en lookup: {url}")
-        return str(matches[0])
+        page._dua_captcha_source = src
+        return resolve_captcha(urljoin(page.url, src or ''), self.captcha_lookup)
 
     @staticmethod
-    async def _block_static(page: Page) -> None:
-        """Bloquea CSS y fuentes para acelerar la carga (JS e imágenes se mantienen)."""
-        await page.route(
-            '**/*.{css,woff,woff2,ttf,eot}',
-            lambda route: route.abort(),
-        )
+    async def _block_static(page):
+        async def route_request(route):
+            if route.request.resource_type in ('stylesheet', 'font', 'image', 'media'):
+                await route.abort()
+            else:
+                await route.continue_()
+        await page.route('**/*', route_request)
 
-    # ── IO sincrónico (llamado dentro de io_lock) ────────────────────────────
+    @staticmethod
+    def _validate(data, dua_number):
+        return validate_result(data, dua_number)
 
-    def _validate(self, data: pd.DataFrame, dua_number: str) -> None:
-        if (data is None or data.empty
-                or 'numero_del_dua' not in data.columns
-                or data['numero_del_dua'].iloc[0].strip() == ''):
-            raise ValueError(f"Datos vacíos para DUA {dua_number}")
-
-    def _write_csv(self, data: pd.DataFrame) -> None:
-        path = self.output_paths['output_csv']
-        header = not os.path.exists(path)
-        data.to_csv(path, mode='a', header=header, index=False, encoding='utf-8-sig')
-
-    def _log_processed(self, dua_number: str) -> None:
-        with open(self.output_paths['processed_log'], 'a', encoding='utf-8') as f:
-            f.write(f"{dua_number}\n")
-
-    def _log_failed(self, dua_number: str) -> None:
-        with open(self.output_paths['failed_duas'], 'a', encoding='utf-8') as f:
-            f.write(f"{dua_number}\n")
+    async def _save_evidence(self, page, dua):
+        if page is None or 'diagnostics' not in self.output_paths:
+            return ''
+        folder = Path(self.output_paths['diagnostics'])
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            html = await asyncio.wait_for(page.content(), timeout=3)
+            (folder / f'{dua}.html').write_text(html, encoding='utf-8')
+            snapshot = getattr(page, '_dua_form_snapshot', None)
+            if snapshot:
+                (folder / f'{dua}.json').write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
+            return str(folder / f'{dua}.html')
+        except Exception:
+            logging.warning('No se pudo guardar evidencia para %s.', dua, extra={'technical_only': True})
+            return ''

@@ -3,6 +3,9 @@ import os
 import json
 import logging
 import re
+import hashlib
+from logging.handlers import RotatingFileHandler
+from core.job_store import atomic_output
 
 import sys
 
@@ -17,27 +20,21 @@ _CONFIG_DIR    = os.path.join(_BASE_DIR, 'config')
 _MACHINE_PATH  = os.path.join(_CONFIG_DIR, 'machine.json')
 _SESSION_PATH  = os.path.join(_CONFIG_DIR, 'session.json')
 
-def get_names_path() -> str:
-    """Ruta al archivo Names_TicaPortal.xlsx — embebido en el exe o en el proyecto."""
-    if getattr(sys, 'frozen', False):
-        return os.path.join(sys._MEIPASS, 'Names_TicaPortal.xlsx')
-    return os.path.join(_BASE_DIR, 'Names_TicaPortal.xlsx')
-
-
 _DEFAULT_MACHINE = {
     "base_path":        "",
     "output_base_path": "",
     "max_retries":      3,
-    "timeout":          10,
+    "timeout":          30,
     "cant_hilos":       1,
+    "reuse_context":    True,
+    "lightweight_details": True,
     "headless":         True,
+    "dark_mode":        True,
 }
 
 _DEFAULT_SESSION = {
     "sheet_name":      "",
     "input_file_path": "",
-    "progress":        {},
-    "totals":          {},
 }
 
 
@@ -52,21 +49,21 @@ def _ensure_config() -> None:
             json.dump(_DEFAULT_SESSION, f, indent=4, ensure_ascii=False)
 
 
-# ── Config de máquina (rutas, driver, parámetros estáticos) ──────────────────
+# ── Config de máquina (rutas y parámetros estáticos) ─────────────────────────
 
 def load_machine_config() -> dict:
     _ensure_config()
     with open(_MACHINE_PATH, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        return {**_DEFAULT_MACHINE, **json.load(f)}
 
 
 def save_machine_config(config: dict) -> None:
     os.makedirs(_CONFIG_DIR, exist_ok=True)
-    with open(_MACHINE_PATH, 'w', encoding='utf-8') as f:
+    with atomic_output(_MACHINE_PATH) as f:
         json.dump(config, f, indent=4, ensure_ascii=False)
 
 
-# ── Sesión (hoja activa, ruta de entrada, progreso de reanudación) ───────────
+# ── Sesión (selección de archivo y hoja; la cola está en SQLite) ──────────────
 
 def load_session() -> dict:
     _ensure_config()
@@ -76,7 +73,7 @@ def load_session() -> dict:
 
 def save_session(session: dict) -> None:
     os.makedirs(_CONFIG_DIR, exist_ok=True)
-    with open(_SESSION_PATH, 'w', encoding='utf-8') as f:
+    with atomic_output(_SESSION_PATH) as f:
         json.dump(session, f, indent=4, ensure_ascii=False)
 
 
@@ -87,26 +84,40 @@ def normalize_key(name: str) -> str:
     return re.sub(r'\W+', '_', name.strip().lower())
 
 
-def compute_output_paths(output_base: str, sheet_name: str) -> dict:
+def dataset_key(source: str, sheet_name: str) -> str:
+    identity = os.path.normcase(os.path.abspath(source)) + '\n' + sheet_name
+    return hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
+
+
+def get_queue_path(source: str, sheet_name: str) -> str:
+    return os.path.join(_BASE_DIR, 'data', 'queues', dataset_key(source, sheet_name) + '.sqlite3')
+
+
+def get_catalog_folder():
+    return os.path.join(_BASE_DIR, 'data', 'queues')
+
+
+def compute_output_paths(output_base: str, sheet_name: str, source: str = '', table_id: str = '') -> dict:
     """
     Calcula y crea (si no existe) la carpeta de salida para una hoja.
-    Retorna dict con: output_csv, failed_duas, no_rows_duas.
+    Separa archivos con hojas homónimas mediante un identificador del lote.
     """
-    folder = os.path.join(output_base, sheet_name)
+    safe_sheet = normalize_key(sheet_name) or 'hoja'
+    folder = os.path.join(output_base, safe_sheet)
+    if table_id:
+        folder = os.path.join(folder, table_id)
+    elif source:
+        folder = os.path.join(folder, dataset_key(source, sheet_name))
     os.makedirs(folder, exist_ok=True)
     return {
-        'output_csv':    os.path.join(folder, f'MM20YY_Detalles_DUAs__procesados_{sheet_name}.csv'),
-        'failed_duas':   os.path.join(folder, f'Detalles_DUAs_fallidas_{sheet_name}.txt'),
-        'no_rows_duas':  os.path.join(folder, f'Detalles_DUAs_sin_filas_{sheet_name}.txt'),
-        'processed_log': os.path.join(folder, f'Detalles_DUAs_procesados_log_{sheet_name}.txt'),
+        'output_csv':    os.path.join(folder, f'Detalles_DUAs_{safe_sheet}.csv'),
+        'failed_duas':   os.path.join(folder, f'Detalles_DUAs_pendientes_{safe_sheet}.txt'),
+        'processed_log': os.path.join(folder, f'Detalles_DUAs_procesados_log_{safe_sheet}.txt'),
+        'pending_json':  os.path.join(folder, 'pendientes.json'),
+        'diagnostics':   os.path.join(folder, 'diagnosticos'),
+        'legacy_csv':    os.path.join(output_base, sheet_name,
+                                     f'MM20YY_Detalles_DUAs__procesados_{sheet_name}.csv'),
     }
-
-
-def get_extracted_path(sheet_name: str) -> str:
-    """Ruta local donde se guarda la copia de la hoja de entrada."""
-    folder = os.path.join(_BASE_DIR, 'data', 'Datos_Cargados')
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, f'{sheet_name}.xlsx')
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -117,11 +128,13 @@ def setup_logging(log_file: str = None) -> None:
     log_dir = os.path.dirname(log_file)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
+    console = logging.StreamHandler()
+    console.addFilter(lambda record: not getattr(record, 'technical_only', False))
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler(),
+            RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3, encoding='utf-8'),
+            console,
         ],
     )

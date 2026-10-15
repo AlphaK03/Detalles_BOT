@@ -11,7 +11,9 @@ __pycache__/
 # Build / distribución
 build/
 dist/
+/DetallesBot_AstraCode.exe
 *.spec
+!DetallesBot.spec
 
 # Logs
 logs/
@@ -22,9 +24,49 @@ src/logs/
 config/session.json
 src/data/Datos_Cargados/
 data/Datos_Cargados/
+data/queues/
+data/test_runs/
 
 # Archivos de datos grandes (no versionables)
 Names_TicaPortal.xlsx
 
 # Claude Code internal
 .claude/
+
+# Respaldo de código y recursos; datos personales y cachés permanecen locales.
+**/.venv/
+**/venv/
+**/node_modules/
+**/__pycache__/
+**/build/
+**/dist/
+**/.idea/
+**/.build/
+**/logs/
+**/runtime/
+**/data/
+**/datos_app/
+**/resultados/
+**/RESULTADOS/
+**/Descargas/
+**/output/
+**/outputs/
+**/temp/
+**/tmp/
+.env
+.env.*
+!.env.example
+!.env.sample
+*.py[cod]
+*.log
+*.sqlite*
+*.db
+*.db-wal
+*.db-shm
+*.dpapi
+*.pem
+*.pfx
+*.p12
+**/token_cache.json
+**/tokens.json
+**/session.json

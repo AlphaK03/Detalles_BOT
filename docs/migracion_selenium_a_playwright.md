@@ -1,5 +1,9 @@
 # Migración Selenium → Playwright (browser compartido)
 
+> Documento histórico. La rama AstraCode sustituye la reanudación por índice y el
+> Excel CAPTCHA por SQLite y JSON. Consultar [el análisis actualizado](analisis_astracode.md)
+> y [README](../README.md) para el flujo activo y la configuración actual.
+
 Guía de referencia para aplicar esta migración a cualquier bot de la familia TICA que use la misma arquitectura (`BaseFlow` + `DUAProcessor`).
 
 ---

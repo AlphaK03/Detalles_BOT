@@ -1,18 +1,17 @@
 """app.py — Ventana principal del bot (CHC CONSULTORES — Detalles BOT).
 
-Estructura de pestañas:
-  - Procesamiento : selección de archivo/hoja, progreso, log, Iniciar/Detener
-  - Configuración : todos los parámetros editables (hilos, timeout, reintentos,
-                    rutas, driver) — sin necesidad de tocar JSON
+Pantalla compacta con selección, progreso, consola y acciones.
+Configuración separada; administrador local de tablas en ventana aparte.
 """
 import os
 import sys
 import threading
 import logging
+import queue
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 import tkinter as tk
-import pandas as pd
+from openpyxl import load_workbook
 
 _SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC_DIR not in sys.path:
@@ -21,36 +20,37 @@ if _SRC_DIR not in sys.path:
 from utils import (
     load_machine_config, save_machine_config,
     load_session, save_session,
-    compute_output_paths, get_extracted_path,
-    normalize_key, setup_logging, get_names_path,
+    compute_output_paths, get_catalog_folder, dataset_key, setup_logging,
 )
-from core.playwright_processor import PlaywrightDUAProcessor, load_processed_duas_from_log
+from core.playwright_processor import PlaywrightDUAProcessor
+from core.captcha import load_captcha_lookup
+from core.job_store import JobStore, RunLock
+from core.catalog import TableCatalog
 from flows.detalles_flow import DetallesFlow
+from ui.theme import apply_theme
+from ui.database_manager import DatabaseWindow
+from ui.import_dialog import ImportNameDialog
 
 
 # ── Logging handler ───────────────────────────────────────────────────────────
 
 class _GuiLogHandler(logging.Handler):
-    _FMT = logging.Formatter('%(asctime)s  %(levelname)-7s  %(message)s',
+    _FMT = logging.Formatter('%(asctime)s  %(message)s',
                               datefmt='%H:%M:%S')
 
-    def __init__(self, widget: ScrolledText):
+    def __init__(self, events):
         super().__init__()
-        self.widget = widget
+        self.events = events
         self.setFormatter(self._FMT)
 
     def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, 'technical_only', False):
+            return
         msg = self.format(record)
         # Permite tags personalizados via extra={'tag': 'SUCCESS'}
         tag = getattr(record, 'tag', record.levelname)
 
-        def _append():
-            self.widget.config(state='normal')
-            self.widget.insert('end', msg + '\n', tag)
-            self.widget.see('end')
-            self.widget.config(state='disabled')
-
-        self.widget.after(0, _append)
+        self.events.put(('log', (msg, tag)))
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -60,21 +60,32 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("CHC CONSULTORES — Detalles BOT")
-        self.resizable(False, False)
+        self.geometry("760x610")
+        self.minsize(720, 570)
 
         self.machine = load_machine_config()
         self.session = load_session()
+        self.catalog = TableCatalog(get_catalog_folder())
+        self.catalog.discover_legacy()
+        self._active_table = None
+        self._importing = False
 
-        self._names_df = None
+        self._captcha_lookup = None
+        self._events = queue.SimpleQueue()
+        self._running = False
+        self._closing = False
         self._stop_event = threading.Event()
-        self._stats = {'success': 0, 'failed': 0, 'skipped': 0, 'total': 0}
-        self._last_saved_index = -1  # mayor índice confirmado en sesión
-        self._resume_from = -1       # índice de inicio de la ejecución actual
+        self._stats = {}
 
         self._build_ui()
         self._setup_logging()
-        self._load_names_file()
+        try:
+            self._captcha_lookup = load_captcha_lookup()
+            logging.info('Aplicación lista para consultar.')
+        except Exception as exc:
+            messagebox.showerror('Catálogo CAPTCHA', str(exc))
         self._restore_session()
+        self.after(100, self._poll_events)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -83,583 +94,587 @@ class App(tk.Tk):
     # ═════════════════════════════════════════════════════════════════════════
 
     def _build_ui(self):
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill='both', expand=True, padx=10, pady=(10, 0))
-
-        tab_proc = ttk.Frame(notebook, padding=10)
-        tab_cfg  = ttk.Frame(notebook, padding=10)
-
-        notebook.add(tab_proc, text="  Procesamiento  ")
-        notebook.add(tab_cfg,  text="  Configuración  ")
-
-        self._build_tab_procesamiento(tab_proc)
-        self._build_tab_configuracion(tab_cfg)
-
-        # Botones globales (siempre visibles)
+        self._dark_var = tk.BooleanVar(value=self.machine.get('dark_mode', True))
+        self.colors = apply_theme(self, self._dark_var.get())
+        self._config_widgets = []
+        self._config_dirty = False
+        header = ttk.Frame(self, padding=(12, 8, 12, 5))
+        header.pack(fill='x')
+        ttk.Label(header, text="Detalles BOT", font=('Segoe UI', 13, 'bold')).pack(side='left')
+        ttk.Label(header, text="CHC CONSULTORES", style='Muted.TLabel').pack(side='right')
+        self._notebook = ttk.Notebook(self)
+        self._tab_proc = ttk.Frame(self._notebook, padding=8)
+        self._tab_cfg = ttk.Frame(self._notebook, padding=8)
+        self._notebook.add(self._tab_proc, text="Procesamiento")
+        self._notebook.add(self._tab_cfg, text="Configuración")
+        self._path_vars = {'output_base_path': tk.StringVar(value=self.machine.get('output_base_path', ''))}
+        self._build_tab_procesamiento(self._tab_proc)
+        self._build_tab_configuracion(self._tab_cfg)
         self._build_action_bar()
-
-    # ── Pestaña Procesamiento ─────────────────────────────────────────────────
+        self._notebook.pack(fill='both', expand=True, padx=10)
+        for var in (*self._param_vars.values(), self._headless_var):
+            var.trace_add('write', self._mark_config_dirty)
+        self._dark_var.trace_add('write', self._appearance_changed)
 
     def _build_tab_procesamiento(self, parent):
-        # Selección de archivo
-        sel = ttk.LabelFrame(parent, text=" Archivo de DUAs ", padding=8)
-        sel.pack(fill='x', pady=(0, 6))
-        sel.columnconfigure(1, weight=1)
-
-        ttk.Label(sel, text="Archivo:").grid(row=0, column=0, sticky='w')
+        fields = ttk.LabelFrame(parent, text=" Importar o abrir una tabla guardada ", padding=(8, 6))
+        fields.pack(fill='x', pady=(0, 7))
+        fields.columnconfigure(1, weight=1)
         self._file_var = tk.StringVar()
-        ttk.Entry(sel, textvariable=self._file_var, width=52,
-                  state='readonly').grid(row=0, column=1, padx=6, sticky='ew')
-        ttk.Button(sel, text="Buscar…",
-                   command=self._select_file).grid(row=0, column=2)
-
-        ttk.Label(sel, text="Hoja:").grid(row=1, column=0, sticky='w', pady=(6, 0))
+        self._file_display = tk.StringVar(value="Selecciona un archivo Excel")
+        ttk.Label(fields, text="Archivo:", style='Card.TLabel').grid(row=0, column=0, sticky='w', padx=(0, 8))
+        ttk.Entry(fields, textvariable=self._file_var, state='readonly').grid(row=0, column=1, sticky='ew')
+        self._browse_btn = ttk.Button(fields, text="Elegir Excel…", command=self._select_file, width=15)
+        self._browse_btn.grid(row=0, column=2, padx=(8, 0), pady=2)
+        ttk.Label(fields, text="Hoja:", style='Card.TLabel').grid(row=1, column=0, sticky='w')
         self._sheet_var = tk.StringVar(value=self.session.get('sheet_name', ''))
-        self._sheet_combo = ttk.Combobox(sel, textvariable=self._sheet_var,
-                                          width=32, state='disabled')
-        self._sheet_combo.grid(row=1, column=1, sticky='w', padx=6, pady=(6, 0))
+        self._sheet_combo = ttk.Combobox(fields, textvariable=self._sheet_var, state='disabled', width=26)
+        self._sheet_combo.grid(row=1, column=1, sticky='w', pady=4)
         self._sheet_combo.bind('<<ComboboxSelected>>', self._on_sheet_selected)
+        self._source_hint = ttk.Label(fields, text="", style='Hint.TLabel')
+        self._source_hint.grid(row=1, column=2, sticky='w', padx=(8, 0))
+        ttk.Label(fields, text="Guardar en:", style='Card.TLabel').grid(row=2, column=0, sticky='w')
+        ttk.Entry(fields, textvariable=self._path_vars['output_base_path'], state='readonly').grid(
+            row=2, column=1, sticky='ew')
+        self._output_btn = ttk.Button(fields, text="Elegir carpeta…", width=15,
+                                      command=lambda: self._browse_folder('output_base_path'))
+        self._output_btn.grid(row=2, column=2, padx=(8, 0), pady=2)
+        ttk.Label(fields, text="Tabla:", style='Card.TLabel').grid(row=3, column=0, sticky='w')
+        self._table_name = tk.StringVar()
+        self._name_entry = ttk.Entry(fields, textvariable=self._table_name)
+        self._name_entry.grid(row=3, column=1, sticky='ew', pady=4)
+        self._import_btn = ttk.Button(fields, text="Guardar tabla", command=self._import_table, width=15)
+        self._import_btn.grid(row=3, column=2, padx=(8, 0))
+        self._file_var.trace_add('write', self._update_source_label)
 
-        # Progreso
-        prog = ttk.LabelFrame(parent, text=" Progreso ", padding=8)
-        prog.pack(fill='x', pady=(0, 6))
-
-        # ── Contador grande X / Y ──────────────────────────────────────────
-        counter_row = tk.Frame(prog, bg='#000000')
-        counter_row.pack(fill='x', pady=(0, 4))
-
-        self._counter_label = tk.Label(
-            counter_row, text="0 / —",
-            font=('Consolas', 22, 'bold'), fg='#FFFFFF', bg='#000000',
-        )
-        self._counter_label.pack(side='left', padx=4)
-
-        self._pct_label = tk.Label(
-            counter_row, text="0.0%",
-            font=('Consolas', 12), fg='#888888', bg='#000000',
-        )
-        self._pct_label.pack(side='right', padx=8)
-
-        # ── Barra de progreso ─────────────────────────────────────────────
+        progress = ttk.LabelFrame(parent, text=" Progreso ", padding=(8, 6))
+        progress.pack(fill='x', pady=(0, 7))
+        top = ttk.Frame(progress, style='Card.TFrame')
+        top.pack(fill='x')
+        self._counter_label = ttk.Label(top, text="0 / —", style='Card.TLabel',
+                                        font=('Segoe UI', 17, 'bold'))
+        self._counter_label.pack(side='left')
+        self._pct_label = ttk.Label(top, text="0.0%", style='Card.TLabel',
+                                    foreground=self.colors['ACCENT'], font=('Segoe UI', 11, 'bold'))
+        self._pct_label.pack(side='right')
         self._progress_var = tk.DoubleVar()
-        ttk.Progressbar(prog, variable=self._progress_var,
-                        maximum=100).pack(fill='x', pady=(0, 4))
-
-        # ── Stats de esta sesión ──────────────────────────────────────────
-        bottom_row = ttk.Frame(prog)
-        bottom_row.pack(fill='x')
-
-        self._stats_label = ttk.Label(bottom_row,
-                                       text="Esta sesion:  OK 0   Error 0   Omitidos 0",
-                                       foreground='gray')
-        self._stats_label.pack(side='left')
-
-        self._status_label = ttk.Label(bottom_row, text="Esperando para iniciar…",
-                                        foreground='gray')
-        self._status_label.pack(side='right')
-
-        # Log / Consola
-        log_frame = ttk.LabelFrame(parent, text=" Consola ", padding=4)
-        log_frame.pack(fill='both', expand=True)
-
-        self._log_text = ScrolledText(
-            log_frame, height=13, state='disabled',
-            font=('Consolas', 8), wrap='none',
-            background='#000000', foreground='#FF8C00',
-            insertbackground='white',
-        )
-        self._log_text.pack(fill='both', expand=True)
-
-        self._log_text.tag_config('DEBUG',    foreground='#444444')
-        self._log_text.tag_config('INFO',     foreground='#FF8C00')
-        self._log_text.tag_config('WARNING',  foreground='#FFFF00')
-        self._log_text.tag_config('ERROR',    foreground='#FF3333')
-        self._log_text.tag_config('CRITICAL', foreground='#FF0000',
-                                   font=('Consolas', 8, 'bold'))
-        self._log_text.tag_config('SUCCESS',  foreground='#00FF41',
-                                   font=('Consolas', 8, 'bold'))
-
-    # ── Pestaña Configuración ─────────────────────────────────────────────────
+        ttk.Progressbar(progress, variable=self._progress_var, maximum=100).pack(fill='x', pady=(4, 6))
+        metrics = ttk.Frame(progress, style='Card.TFrame')
+        metrics.pack(fill='x')
+        self._metric_labels = {}
+        for column, (key, title, color) in enumerate([
+            ('succeeded', 'Guardados:', self.colors['SUCCESS']), ('remaining', 'Pendientes:', self.colors['INK']),
+            ('running', 'En curso:', self.colors['ACCENT']), ('invalid', 'Revisar:', self.colors['WARNING']),
+        ]):
+            metrics.columnconfigure(column, weight=1)
+            cell = ttk.Frame(metrics, style='Card.TFrame')
+            cell.grid(row=0, column=column, sticky='w')
+            ttk.Label(cell, text=title, style='Hint.TLabel').pack(side='left')
+            value = ttk.Label(cell, text="—", style='Card.TLabel', foreground=color,
+                              font=('Segoe UI', 10, 'bold'))
+            value.pack(side='left', padx=(4, 0))
+            self._metric_labels[key] = value
+        self._status_label = ttk.Label(progress, text="Listo para empezar", style='Card.TLabel',
+                                       font=('Segoe UI', 9, 'bold'), foreground=self.colors['MUTED'])
+        self._status_label.pack(anchor='w', pady=(5, 0))
+        self._stats_label = ttk.Label(progress, text="Los resultados se guardan automáticamente.",
+                                      style='Hint.TLabel')
+        self._stats_label.pack(anchor='w', pady=(2, 0))
+        self._build_activity(parent)
 
     def _build_tab_configuracion(self, parent):
-
-        # ── Parámetros de procesamiento ───────────────────────────────────
-        proc_frame = ttk.LabelFrame(parent, text=" Parámetros de procesamiento ", padding=10)
-        proc_frame.pack(fill='x', pady=(0, 8))
-        proc_frame.columnconfigure(1, weight=1)
-
-        params = [
-            ("Cantidad de hilos:",  'cant_hilos',  1,  20, 1),
-            ("Timeout (segundos):", 'timeout',     5,  120, 10),
-            ("Máx. reintentos:",    'max_retries', 1,  10, 3),
-        ]
+        panel = ttk.LabelFrame(parent, text=" Parámetros de consulta ", padding=12)
+        panel.pack(fill='x')
+        panel.columnconfigure(2, weight=1)
         self._param_vars = {}
-        for row_i, (label, key, lo, hi, default) in enumerate(params):
-            ttk.Label(proc_frame, text=label).grid(
-                row=row_i, column=0, sticky='w', pady=3)
+        for row, (key, label, hint, low, high, default) in enumerate([
+            ('cant_hilos', 'Consultas simultáneas', 'Empieza con 1.', 1, 20, 1),
+            ('timeout', 'Tiempo de espera (s)', 'Máximo por operación.', 5, 120, 30),
+            ('max_retries', 'Rondas de intentos', 'Cada ronda prueba los pendientes.', 1, 10, 3),
+        ]):
+            ttk.Label(panel, text=label, style='Card.TLabel').grid(row=row, column=0, sticky='w', pady=7)
             var = tk.IntVar(value=int(self.machine.get(key, default)))
             self._param_vars[key] = var
-            spin = ttk.Spinbox(proc_frame, from_=lo, to=hi, textvariable=var,
-                               width=8, state='readonly')
-            spin.grid(row=row_i, column=1, sticky='w', padx=8, pady=3)
-
-            descs = {
-                'cant_hilos':  "Contextos Playwright paralelos. Un proceso Chromium compartido — puede subir a 5-10.",
-                'timeout':     "Segundos de espera máxima por elemento o navegación.",
-                'max_retries': "Veces que se reintenta un DUA antes de marcarlo como fallido.",
-            }
-            ttk.Label(proc_frame, text=descs[key],
-                      foreground='gray').grid(row=row_i, column=2, sticky='w', padx=8)
-
-        # Modo headless
-        next_row = len(params)
+            spin = ttk.Spinbox(panel, from_=low, to=high, textvariable=var, width=6, state='readonly')
+            spin.grid(row=row, column=1, padx=14)
+            ttk.Label(panel, text=hint, style='Hint.TLabel').grid(row=row, column=2, sticky='w')
+            self._config_widgets.append((spin, 'readonly'))
         self._headless_var = tk.BooleanVar(value=bool(self.machine.get('headless', True)))
-        ttk.Checkbutton(
-            proc_frame,
-            text="Ocultar ventana del navegador (modo headless)",
-            variable=self._headless_var,
-        ).grid(row=next_row, column=0, columnspan=3, sticky='w', pady=(8, 2))
-        ttk.Label(
-            proc_frame,
-            text="Desactivar para depurar — ver el browser en tiempo real.",
-            foreground='gray',
-        ).grid(row=next_row + 1, column=0, columnspan=3, sticky='w', padx=4)
+        toggle = ttk.Checkbutton(panel, text="Mantener el navegador oculto", variable=self._headless_var)
+        toggle.grid(row=3, column=0, columnspan=3, sticky='w', pady=(12, 2))
+        self._config_widgets.append((toggle, 'normal'))
+        appearance = ttk.LabelFrame(parent, text=" Apariencia ", padding=12)
+        appearance.pack(fill='x', pady=(10, 0))
+        ttk.Checkbutton(appearance, text="Modo oscuro", variable=self._dark_var).pack(anchor='w')
+        ttk.Label(appearance, text="Se aplica al instante y se recuerda al guardar la configuración.",
+                  style='Hint.TLabel').pack(anchor='w', pady=(5, 0))
+        row = ttk.Frame(parent)
+        row.pack(fill='x', pady=10)
+        self._save_btn = ttk.Button(row, text="Guardar configuración", command=self._save_config,
+                                    style='Primary.TButton')
+        self._save_btn.pack(side='right')
+        self._cfg_saved_label = ttk.Label(row, text="Configuración guardada", style='Muted.TLabel')
+        self._cfg_saved_label.pack(side='left')
+        ttk.Label(parent, text="Los ajustes se aplican al iniciar. Los resultados guardados se conservan.",
+                  style='Muted.TLabel', wraplength=630).pack(anchor='w', pady=4)
 
-        # ── Rutas ─────────────────────────────────────────────────────────
-        paths_frame = ttk.LabelFrame(parent, text=" Rutas ", padding=10)
-        paths_frame.pack(fill='x', pady=(0, 8))
-        paths_frame.columnconfigure(1, weight=1)
-
-        path_rows = [
-            ("Carpeta de salida:", 'output_base_path', 'folder',
-             "Donde se guardan los CSV y archivos de DUAs fallidas."),
-        ]
-        self._path_vars = {}
-        for row_i, (label, key, kind, desc) in enumerate(path_rows):
-            ttk.Label(paths_frame, text=label).grid(
-                row=row_i * 2, column=0, sticky='w', pady=(6, 0))
-            var = tk.StringVar(value=self.machine.get(key, ''))
-            self._path_vars[key] = var
-            ttk.Entry(paths_frame, textvariable=var, width=52,
-                      state='readonly').grid(
-                row=row_i * 2, column=1, padx=6, sticky='ew', pady=(6, 0))
-
-            browse_cmd = (
-                (lambda k=key: self._browse_folder(k)) if kind == 'folder'
-                else (lambda k=key: self._browse_file(k))
-            )
-            ttk.Button(paths_frame, text="Buscar…",
-                       command=browse_cmd).grid(
-                row=row_i * 2, column=2, pady=(6, 0))
-
-            ttk.Label(paths_frame, text=desc, foreground='gray').grid(
-                row=row_i * 2 + 1, column=1, columnspan=2,
-                sticky='w', padx=6, pady=(0, 2))
-
-        # ── Botón guardar ─────────────────────────────────────────────────
-        save_row = ttk.Frame(parent)
-        save_row.pack(fill='x', pady=(4, 0))
-        ttk.Button(save_row, text="  Guardar configuración  ",
-                   command=self._save_config).pack(side='right')
-        self._cfg_saved_label = ttk.Label(save_row, text="", foreground='#006400')
-        self._cfg_saved_label.pack(side='right', padx=10)
-
-    # ── Barra de acciones (siempre visible bajo las pestañas) ─────────────────
+    def _build_activity(self, parent):
+        panel = ttk.LabelFrame(parent, text=" Actividad ", padding=5)
+        panel.pack(fill='both', expand=True)
+        self._log_text = ScrolledText(panel, height=6, state='disabled', font=('Consolas', 9),
+                                     wrap='word', background='#121B28', foreground='#F2B269',
+                                     insertbackground='white', relief='sunken', borderwidth=1, padx=6, pady=5)
+        self._log_text.pack(fill='both', expand=True)
+        for tag, color in [('DEBUG', '#A8B7C9'), ('INFO', '#F2B269'), ('WARNING', '#FFD479'),
+                           ('ERROR', '#FF8E88'), ('CRITICAL', '#FF8E88'), ('SUCCESS', '#84D8A3')]:
+            self._log_text.tag_config(tag, foreground=color)
 
     def _build_action_bar(self):
-        bar = ttk.Frame(self, padding=(10, 6, 10, 10))
-        bar.pack(fill='x')
-
-        self._folder_btn = ttk.Button(bar, text="Abrir carpeta resultados",
-                                       command=self._open_output_folder)
+        footer = ttk.Frame(self, padding=(12, 7, 12, 8))
+        footer.pack(side='bottom', fill='x')
+        self._action_hint = ttk.Label(footer, text="Selecciona un Excel para empezar.",
+                                      style='Muted.TLabel', wraplength=690)
+        self._action_hint.pack(anchor='w', pady=(0, 6))
+        buttons = ttk.Frame(footer)
+        buttons.pack(fill='x')
+        self._folder_btn = ttk.Button(buttons, text="Resultados", command=self._open_output_folder)
         self._folder_btn.pack(side='left')
-
-        self._stop_btn = ttk.Button(bar, text="Detener",
-                                     command=self._stop_processing, state='disabled')
-        self._stop_btn.pack(side='right', padx=(6, 0))
-
-        self._start_btn = ttk.Button(bar, text="  Iniciar  ",
-                                      command=self._start_processing)
+        self._pending_btn = ttk.Button(buttons, text="Base de datos", command=self._open_pending)
+        self._pending_btn.pack(side='left', padx=5)
+        self._refresh_btn = ttk.Button(buttons, text="Actualizar", command=self._refresh_counter)
+        self._refresh_btn.pack(side='left')
+        self._clear_btn = ttk.Button(buttons, text="Limpiar vista", command=self._clear_log)
+        self._clear_btn.pack(side='left', padx=5)
+        self._start_btn = ttk.Button(buttons, text="Iniciar consultas", style='Primary.TButton',
+                                     command=self._start_processing)
         self._start_btn.pack(side='right')
+        self._stop_btn = ttk.Button(buttons, text="Detener", style='Stop.TButton',
+                                    command=self._stop_processing, state='disabled')
+        self._stop_btn.pack(side='right', padx=6)
 
-        ttk.Button(bar, text="Reiniciar progreso",
-                   command=self._reset_session).pack(side='right', padx=(0, 12))
+    def _clear_log(self):
+        self._log_text.config(state='normal')
+        self._log_text.delete('1.0', 'end')
+        self._log_text.config(state='disabled')
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # Logging
-    # ═════════════════════════════════════════════════════════════════════════
+    def _mark_config_dirty(self, *args):
+        self._config_dirty = True
+        self._cfg_saved_label.config(text="Cambios sin guardar", foreground=self.colors['WARNING'])
+
+    def _appearance_changed(self, *args):
+        self.colors = apply_theme(self, self._dark_var.get())
+        self._pct_label.configure(foreground=self.colors['ACCENT'])
+        for key, color in [('succeeded', 'SUCCESS'), ('remaining', 'INK'), ('running', 'ACCENT'), ('invalid', 'WARNING')]:
+            self._metric_labels[key].configure(foreground=self.colors[color])
+        self._status_label.configure(foreground=self.colors['ACCENT'])
+        self._mark_config_dirty()
+        for child in self.winfo_children():
+            if isinstance(child, tk.Toplevel):
+                child.configure(background=self.colors['BG'])
+
+    def _update_source_label(self, *args):
+        path = self._file_var.get()
+        name = os.path.basename(path) if path else "Ningún archivo seleccionado"
+        self._file_display.set(name if len(name) < 53 else name[:24] + '…' + name[-24:])
+        self._source_hint.config(text="Tabla guardada" if self._active_table else "Columna: NroDUA")
+
+    def _update_actions(self):
+        path, sheet = self._file_var.get(), self._sheet_var.get().strip()
+        base = self.machine.get('output_base_path', '')
+        total, done = self._stats.get('total', 0), self._stats.get('succeeded', 0)
+        if self._running:
+            self._start_btn.config(text="Importando…" if self._importing else "Consultando…", state='disabled')
+            self._action_hint.config(text="Guardando la lista; espera un momento." if self._importing else
+                                     "Puedes detenerte cuando quieras. Los pendientes se conservan.")
+            return
+        if not self._active_table:
+            hint = "Elige Excel y hoja, revisa el nombre y guarda la tabla. O abre una desde Base de datos."
+        elif not base:
+            hint = "Elige dónde guardar los resultados."
+        elif total and done == total:
+            hint = "Todos los DUAs tienen resultado. Puedes volver a generar los archivos."
+        elif total:
+            hint = "Retoma los pendientes; los resultados guardados se conservan."
+        else:
+            hint = "Tabla guardada. Ya no necesitas el archivo Excel para continuar."
+        self._action_hint.config(text=hint)
+        text = "Actualizar resultados" if total and done == total else (
+            "Retomar pendientes" if total else "Iniciar consultas")
+        ready = bool(self._active_table and base and self._captcha_lookup is not None)
+        self._start_btn.config(text=text, state='normal' if ready else 'disabled')
+        self._folder_btn.config(state='normal' if base and self._active_table else 'disabled')
+        self._pending_btn.config(state='normal')
+        self._import_btn.config(state='normal' if path and sheet and not self._active_table else 'disabled')
+        self._name_entry.config(state='readonly' if self._active_table else 'normal')
+
+    def _open_pending(self):
+        DatabaseWindow(self)
 
     def _setup_logging(self):
         setup_logging()
-        handler = _GuiLogHandler(self._log_text)
+        handler = _GuiLogHandler(self._events)
         handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(handler)
+        self._log_handler = handler
 
     # ═════════════════════════════════════════════════════════════════════════
     # Sesión
     # ═════════════════════════════════════════════════════════════════════════
 
     def _restore_session(self):
-        sheet_name     = self.session.get('sheet_name', '')
-        extracted_path = get_extracted_path(sheet_name) if sheet_name else ''
-        if extracted_path and os.path.exists(extracted_path):
-            self._file_var.set(extracted_path)
-            self._populate_sheets(extracted_path, sheet_name)
-        else:
-            path = self.session.get('input_file_path', '')
-            if path and os.path.exists(path):
-                self._file_var.set(path)
-                self._populate_sheets(path, sheet_name)
+        path = self.session.get('input_file_path', '')
+        sheet = self.session.get('sheet_name', '')
+        table_id = self.session.get('active_table_id') or (dataset_key(path, sheet) if path and sheet else '')
+        if table_id:
+            try:
+                self._activate_table(self.catalog.get(table_id))
+                return
+            except (ValueError, OSError):
+                pass
+        self._file_var.set(path)
+        if path and os.path.exists(path):
+            self._populate_sheets(path, sheet)
         self._refresh_counter()
 
+    def _activate_table(self, record):
+        if self._running:
+            return
+        self._active_table = self.catalog.get(record['id'])
+        self._file_var.set('Lista guardada · Excel original ya no necesario')
+        self._sheet_var.set(record['source_sheet'])
+        self._sheet_combo.config(values=[record['source_sheet']], state='disabled')
+        self._table_name.set(record['name'])
+        self._save_selection()
+        self._refresh_counter()
+
+    def _catalog_changed(self):
+        if self._active_table:
+            try:
+                self._activate_table(self.catalog.get(self._active_table['id']))
+            except (ValueError, OSError):
+                self._active_table = None
+                self._file_var.set('')
+                self._sheet_var.set('')
+                self._table_name.set('')
+                self._sheet_combo.config(values=[], state='disabled')
+                self._save_selection()
+                self._refresh_counter()
+
+    def _output_paths(self):
+        record = self._active_table
+        return compute_output_paths(self.machine['output_base_path'], record['output_name'],
+                                    table_id=record['id'])
+
+    def _import_table(self):
+        if self._running or self._active_table:
+            return
+        source, sheet, name = self._file_var.get(), self._sheet_var.get(), self._table_name.get()
+        choice = ImportNameDialog(self, name).result
+        if choice is None:
+            return
+        name, expected_target = choice
+        self._table_name.set(name)
+        base = self.machine.get('output_base_path', '')
+        legacy_csv = os.path.join(base, sheet, f'MM20YY_Detalles_DUAs__procesados_{sheet}.csv') if base else None
+        self._importing = True
+        self._set_controls_running(True)
+        self._status_label.config(text="Guardando la tabla…", foreground=self.colors['ACCENT'])
+
+        def run():
+            try:
+                record = self.catalog.import_excel(source, sheet, name, legacy_csv,
+                                                   list(DetallesFlow().extract_data('').columns),
+                                                   expected_target=expected_target)
+                self._events.put(('imported', (record, None)))
+            except Exception as exc:
+                self._events.put(('imported', (None, str(exc))))
+
+        self._worker_thread = threading.Thread(target=run, daemon=True)
+        self._worker_thread.start()
+
     def _refresh_counter(self):
-        """Actualiza el contador X/Y leyendo el progreso guardado en sesión."""
-        key   = normalize_key(self.session.get('sheet_name', ''))
-        done  = self.session.get('progress', {}).get(key, -1) + 1   # -1 → 0
-        total = self.session.get('totals',   {}).get(key, 0)
-        if total > 0:
-            pct = done / total * 100
-            self._counter_label.config(text=f"{done:,} / {total:,}")
-            self._pct_label.config(text=f"{pct:.1f}%")
-            self._progress_var.set(pct)
-        elif done > 0:
-            self._counter_label.config(text=f"{done:,} / —")
-            self._pct_label.config(text="—")
+        if self._running:
+            return
+        database = self.catalog.database(self._active_table) if self._active_table else ''
+        if database and os.path.exists(database):
+            store = JobStore(database)
+            try:
+                self._show_summary(store.summary())
+            finally:
+                store.close()
         else:
+            self._stats = {}
             self._counter_label.config(text="0 / —")
             self._pct_label.config(text="0.0%")
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # Selectores — pestaña Procesamiento
-    # ═════════════════════════════════════════════════════════════════════════
+            self._progress_var.set(0)
+            for label in self._metric_labels.values():
+                label.config(text='—')
+            self._stats_label.config(text="Los resultados se guardan automáticamente.")
+            self._status_label.config(text="Listo para empezar", foreground=self.colors['MUTED'])
+        self._update_source_label()
+        self._update_actions()
 
     def _select_file(self):
         path = filedialog.askopenfilename(
             title="Seleccionar archivo de DUAs",
-            filetypes=[("Excel", "*.xlsx"), ("Todos los archivos", "*.*")],
-        )
+            filetypes=[("Excel", "*.xlsx"), ("Todos los archivos", "*.*")])
         if not path:
             return
+        self._active_table = None
         self._file_var.set(path)
         self._populate_sheets(path, self.session.get('sheet_name', ''))
-        self.session['input_file_path'] = path
-        self.session['sheet_name'] = self._sheet_var.get().strip()
+        self._save_selection()
+        self._refresh_counter()
+
+    def _save_selection(self):
+        self.session['active_table_id'] = self._active_table['id'] if self._active_table else ''
+        self.session['input_file_path'] = self._active_table['source_path'] if self._active_table else self._file_var.get()
+        self.session['sheet_name'] = self._active_table['source_sheet'] if self._active_table else self._sheet_var.get().strip()
         save_session(self.session)
 
     def _on_sheet_selected(self, event=None):
-        self.session['sheet_name'] = self._sheet_var.get().strip()
-        save_session(self.session)
+        self._table_name.set(self._sheet_var.get())
+        self._save_selection()
+        self._refresh_counter()
 
-    def _populate_sheets(self, path: str, preferred: str = '') -> None:
+    def _populate_sheets(self, path, preferred=''):
+        self._sheet_var.set('')
+        self._sheet_combo.config(values=[], state='disabled')
         try:
-            sheets = pd.ExcelFile(path).sheet_names
-        except Exception as e:
-            messagebox.showerror("Error", f"No se pudo abrir el archivo:\n{e}")
+            workbook = load_workbook(path, read_only=True)
+            try:
+                sheets = workbook.sheetnames
+            finally:
+                workbook.close()
+        except Exception as exc:
+            messagebox.showerror("Error", f"No se pudo abrir el archivo:\n{exc}")
             return
         self._sheet_combo.config(values=sheets, state='readonly')
-        if preferred in sheets:
-            self._sheet_var.set(preferred)
-        elif sheets:
-            self._sheet_var.set(sheets[0])
+        self._sheet_var.set(preferred if preferred in sheets else (sheets[0] if sheets else ''))
+        self._table_name.set(self._sheet_var.get())
 
     def _open_output_folder(self):
-        sheet_name = self._sheet_var.get().strip()
         base = self.machine.get('output_base_path', '')
-        target = os.path.join(base, sheet_name) if sheet_name else base
-        if not os.path.exists(target):
-            target = base
-        if not target or not os.path.exists(target):
-            messagebox.showwarning(
-                "Carpeta no encontrada",
-                "La carpeta de salida no existe todavía.\n"
-                "Inicie el proceso al menos una vez para crearla.",
-            )
+        if not base:
+            messagebox.showwarning("Resultados", "Configure una carpeta de salida.")
             return
-        os.startfile(target)
+        if not self._active_table:
+            return
+        paths = self._output_paths()
+        try:
+            os.startfile(os.path.dirname(paths['output_csv']))
+        except OSError as exc:
+            messagebox.showerror("No se pudo abrir la carpeta", str(exc))
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # Selectores — pestaña Configuración
-    # ═════════════════════════════════════════════════════════════════════════
-
-    def _browse_folder(self, key: str):
+    def _browse_folder(self, key):
+        if self._running:
+            return
         folder = filedialog.askdirectory(title="Seleccionar carpeta")
         if folder:
+            updated = {**self.machine, key: folder}
+            try:
+                save_machine_config(updated)
+            except OSError as exc:
+                messagebox.showerror("No se pudo guardar la carpeta", str(exc))
+                return
+            self.machine = updated
             self._path_vars[key].set(folder)
-
-    def _browse_file(self, key: str):
-        filetypes = (
-            [("Excel", "*.xlsx")] if 'names' in key
-            else [("Ejecutable", "*.exe"), ("Todos", "*.*")]
-        )
-        path = filedialog.askopenfilename(title="Seleccionar archivo",
-                                          filetypes=filetypes)
-        if path:
-            self._path_vars[key].set(path)
+            self._update_actions()
 
     def _save_config(self):
-        """Guarda los valores del panel de configuración en machine.json."""
+        if self._running:
+            return False
+        updated = dict(self.machine)
         for key, var in self._param_vars.items():
             try:
-                self.machine[key] = int(var.get())
-            except ValueError:
+                value = int(var.get())
+                low, high = {'cant_hilos': (1, 20), 'timeout': (5, 120), 'max_retries': (1, 10)}[key]
+                if not low <= value <= high:
+                    raise ValueError()
+                updated[key] = value
+            except (ValueError, tk.TclError):
                 messagebox.showerror("Error", f"Valor inválido para '{key}'.")
-                return
-
+                return False
         for key, var in self._path_vars.items():
-            self.machine[key] = var.get().strip()
-
-        self.machine['headless'] = bool(self._headless_var.get())
-        save_machine_config(self.machine)
-
-        self._cfg_saved_label.config(text="✓ Guardado")
-        self.after(3000, lambda: self._cfg_saved_label.config(text=""))
+            updated[key] = var.get().strip()
+        updated['headless'] = bool(self._headless_var.get())
+        updated['dark_mode'] = bool(self._dark_var.get())
+        # Claves heredadas que ya no usa el motor activo.
+        for key in ('names_file_path', 'edge_driver_path', 'screenshot_path'):
+            updated.pop(key, None)
+        try:
+            save_machine_config(updated)
+        except OSError as exc:
+            messagebox.showerror("No se pudieron guardar los ajustes", str(exc))
+            return False
+        self.machine = updated
+        self._config_dirty = False
+        self._cfg_saved_label.config(text="Ajustes guardados", foreground=self.colors['SUCCESS'])
+        self._update_actions()
         logging.info("Configuración guardada.")
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # CAPTCHAs
-    # ═════════════════════════════════════════════════════════════════════════
-
-    def _load_names_file(self):
-        path = get_names_path()
-        if not os.path.exists(path):
-            logging.error("Names_TicaPortal.xlsx no encontrado: %s", path)
-            messagebox.showerror(
-                "Error interno",
-                "No se encontró el archivo de CAPTCHAs embebido.\n"
-                "Por favor contacte al administrador.",
-            )
-            return
-        self._names_df = pd.read_excel(path)
-        logging.info("Archivo de CAPTCHAs cargado (%d entradas).", len(self._names_df))
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # Inicio / detención
-    # ═════════════════════════════════════════════════════════════════════════
+        return True
 
     def _start_processing(self):
-        if self._names_df is None:
-            messagebox.showerror(
-                "Error",
-                "No se cargó el archivo de CAPTCHAs.\n"
-                "Verifique la ruta en la pestaña Configuración.",
-            )
+        if self._running:
             return
-
-        file_path   = self._file_var.get()
-        sheet_name  = self._sheet_var.get().strip()
-        output_base = self.machine.get('output_base_path', '')
-
-        if not file_path or not os.path.exists(file_path):
-            messagebox.showwarning("Atención", "Seleccione un archivo de DUAs.")
+        if self._config_dirty and not self._save_config():
+            self._notebook.select(self._tab_cfg)
             return
-        if not sheet_name:
-            messagebox.showwarning("Atención", "Seleccione una hoja del archivo.")
+        if self._captcha_lookup is None:
+            messagebox.showerror("Error", "No se cargó el catálogo interno de CAPTCHAs.")
             return
-        if not output_base:
-            messagebox.showwarning(
-                "Atención",
-                "Configure la carpeta de salida en la pestaña Configuración.",
-            )
+        base = self.machine.get('output_base_path', '')
+        if not self._active_table:
+            messagebox.showwarning("Atención", "Guarda la tabla o abre una desde Base de datos.")
             return
-
+        if not base:
+            messagebox.showwarning("Atención", "Configure la carpeta de salida.")
+            return
         try:
-            df = pd.read_excel(file_path, sheet_name=sheet_name)
-            df[['Aduana', 'Año', 'Número']] = df['NroDUA'].str.split('-', expand=True)
-        except Exception as e:
-            messagebox.showerror("Error al cargar datos", str(e))
+            self._save_selection()
+            paths = self._output_paths()
+        except OSError as exc:
+            messagebox.showerror("No se pudo preparar la consulta", str(exc))
             return
-
-        extracted_path = get_extracted_path(sheet_name)
-        try:
-            pd.read_excel(file_path, sheet_name=sheet_name).to_excel(
-                extracted_path, sheet_name=sheet_name, index=False)
-        except Exception as e:
-            logging.warning("No se pudo guardar copia local de la hoja: %s", e)
-
-        # Releer sesión del disco para garantizar que tenemos el progreso más reciente
-        self.session = load_session()
-        self.session['sheet_name']      = sheet_name
-        self.session['input_file_path'] = file_path
-        self.session.setdefault('totals', {})[normalize_key(sheet_name)] = len(df)
-        save_session(self.session)
-
-        output_paths = compute_output_paths(output_base, sheet_name)
-        load_processed_duas_from_log(output_paths['processed_log'])
-
-        key        = normalize_key(sheet_name)
-        progress   = self.session.get('progress', {})
-        start_from = progress.get(key, -1)
-        remaining  = len(df) - (start_from + 1)
-
-        logging.info("─── INICIO DE PROCESAMIENTO ───────────────────────────")
-        logging.info("Hoja seleccionada : '%s'  →  clave: '%s'", sheet_name, key)
-        logging.info("Progreso guardado : %s", progress)
-        logging.info("Índice de inicio  : %d  (reanudando desde fila %d / %d)",
-                     start_from, start_from + 2, len(df))
-        logging.info("DUAs pendientes   : %d", max(remaining, 0))
-        logging.info("───────────────────────────────────────────────────────")
-
-        self._resume_from      = start_from
-        self._last_saved_index = start_from
-        self._stats = {'success': 0, 'failed': 0, 'skipped': 0, 'total': len(df)}
-        self._update_stats_label()
-
-        # Actualizar contador inicial
-        done_initial = start_from + 1  # -1 → 0, 229 → 230
-        total        = len(df)
-        pct_initial  = done_initial / total * 100 if total > 0 else 0
-        self._counter_label.config(text=f"{done_initial:,} / {total:,}")
-        self._pct_label.config(text=f"{pct_initial:.1f}%")
-        self._progress_var.set(pct_initial)
-
-        resume_msg = f"Desde fila {start_from + 2}" if start_from >= 0 else "Inicio"
-        self._status_label.config(
-            text=f"{resume_msg} — {max(remaining, 0)} pendientes",
-            foreground='#FF8C00',
-        )
-
-        self._set_controls_running(True)
         self._stop_event = threading.Event()
-
-        threading.Thread(
-            target=self._run,
-            args=(df, output_paths, start_from),
-            daemon=True,
-        ).start()
+        self._set_controls_running(True)
+        self._notebook.select(self._tab_proc)
+        self._status_label.config(text="Preparando tus DUAs…", foreground=self.colors['ACCENT'])
+        self._worker_thread = threading.Thread(
+            target=self._run, args=(self._active_table['id'], paths, dict(self.machine)), daemon=True)
+        self._worker_thread.start()
 
     def _stop_processing(self):
         self._stop_event.set()
-        self._status_label.config(text="Deteniendo…", foreground='#b87000')
+        self._status_label.config(text="Deteniendo y guardando…", foreground=self.colors['WARNING'])
+        self._action_hint.config(text="Espera un momento mientras se guardan los pendientes.")
         self._stop_btn.config(state='disabled')
 
-    def _set_controls_running(self, running: bool):
-        self._start_btn.config(state='disabled' if running else 'normal')
-        self._stop_btn.config(state='normal' if running else 'disabled')
-        self._sheet_combo.config(state='disabled' if running else 'readonly')
+    def _set_controls_running(self, running):
+        self._running = running
+        for widget in (self._start_btn, self._browse_btn, self._save_btn, self._refresh_btn,
+                       self._output_btn, self._import_btn, self._name_entry):
+            widget.config(state='disabled' if running else 'normal')
+        for widget, idle_state in self._config_widgets:
+            widget.config(state='disabled' if running else idle_state)
+        self._stop_btn.config(state='normal' if running and not self._importing else 'disabled')
+        self._sheet_combo.config(state='disabled' if running or self._active_table or not self._sheet_var.get() else 'readonly')
+        self._update_actions()
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # Hilo de control
-    # ═════════════════════════════════════════════════════════════════════════
-
-    def _run(self, df: pd.DataFrame, output_paths: dict, start_from: int):
-        processor = PlaywrightDUAProcessor(
-            self.machine, output_paths, DetallesFlow(),
-            self._names_df, self._stop_event,
-        )
+    def _run(self, table_id, paths, machine):
+        error = None
+        summary = None
         try:
-            processor.run(df, start_from, self._on_progress)
-        except Exception as e:
-            logging.exception("Error en la ejecución principal: %s", e)
+            database = self.catalog.database(self.catalog.get(table_id))
+            with RunLock(database):
+                self.catalog.get(table_id)
+                store = JobStore(database)
+                try:
+                    flow = DetallesFlow()
+                    logging.info('Tabla lista: %s DUAs; %s ya guardados.',
+                                 store.summary()['total'], store.summary()['succeeded'])
+                    processor = PlaywrightDUAProcessor(
+                        machine, paths, flow, self._captcha_lookup, self._stop_event)
+                    processor.run(store, lambda value: self._events.put(('summary', value)))
+                finally:
+                    summary = store.summary()
+                    store.close()
+        except Exception as exc:
+            error = ('No se pudieron leer o guardar los archivos. Revisa la carpeta de resultados.'
+                     if isinstance(exc, OSError) else
+                     'La consulta se interrumpió. Los pendientes y resultados guardados se conservan.')
+            logging.error(error)
+            logging.exception('Ejecución detenida por error: %s', exc, extra={'technical_only': True})
         finally:
-            self.after(0, self._on_finished)
+            self._events.put(('finished', (summary, error)))
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # Callbacks de progreso
-    # ═════════════════════════════════════════════════════════════════════════
-
-    def _on_progress(self, index: int, status: str) -> None:
-        def _gui():
-            self._stats[status] = self._stats.get(status, 0) + 1
-            total = self._stats['total']
-
-            already      = self._resume_from + 1
-            done_session = (self._stats['success']
-                            + self._stats['failed']
-                            + self._stats['skipped'])
-            done_total = already + done_session
-            pct = done_total / total * 100 if total > 0 else 0
-
-            self._counter_label.config(text=f"{done_total:,} / {total:,}")
-            self._pct_label.config(text=f"{pct:.1f}%")
-            self._progress_var.set(pct)
-            self._update_stats_label()
-            pending = total - done_total
-            self._status_label.config(
-                text=f"Procesando — {pending} pendientes",
-                foreground='#FF8C00',
-            )
-
-            # Guardar el índice máximo alcanzado
-            if index > self._last_saved_index:
-                self._last_saved_index = index
-                key = normalize_key(self.session.get('sheet_name', ''))
-                self.session.setdefault('progress', {})[key] = index
-                save_session(self.session)
-                logging.debug("Progreso guardado → clave '%s' = indice %d", key, index)
-
-        self.after(0, _gui)
-
-    def _on_finished(self):
-        # Guardar el índice final con certeza, por si algún _gui tardó o se perdió
-        if self._last_saved_index >= 0:
-            key = normalize_key(self.session.get('sheet_name', ''))
-            stored = self.session.get('progress', {}).get(key, -1)
-            if self._last_saved_index > stored:
-                self.session.setdefault('progress', {})[key] = self._last_saved_index
-                save_session(self.session)
-
-        s       = self._stats
-        stopped = self._stop_event.is_set()
-        self._set_controls_running(False)
-        self._sheet_combo.config(state='readonly')
-        color = '#FFFF00' if stopped else '#00FF41'
-        msg   = "Detenido" if stopped else "Completado"
-        self._status_label.config(text=msg, foreground=color)
-        logging.info("─── %s ─── OK:%d  Error:%d  Omitidos:%d",
-                     msg.upper(), s['success'], s['failed'], s['skipped'])
-        messagebox.showinfo(
-            "Proceso finalizado",
-            f"Proceso {'detenido' if stopped else 'completado'}.\n\n"
-            f"OK       {s['success']}\n"
-            f"Error    {s['failed']}\n"
-            f"Omitidos {s['skipped']}",
-        )
-
-    def _update_stats_label(self):
-        s = self._stats
-        self._stats_label.config(
-            text=(f"Esta sesion:  "
-                  f"OK {s['success']}   "
-                  f"Error {s['failed']}   "
-                  f"Omitidos {s['skipped']}")
-        )
-
-    def _reset_session(self):
-        if not messagebox.askyesno(
-                "Reiniciar progreso",
-                "¿Desea reiniciar el progreso y volver a procesar desde cero?\n\n"
-                "Se limpiarán únicamente: progreso y totales guardados.\n"
-                "El archivo y la hoja seleccionados se conservarán.",
-        ):
+    def _poll_events(self):
+        for _ in range(200):
+            try:
+                kind, value = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == 'log':
+                msg, tag = value
+                self._log_text.config(state='normal')
+                self._log_text.insert('end', msg + '\n', tag)
+                if int(self._log_text.index('end-1c').split('.')[0]) > 2000:
+                    self._log_text.delete('1.0', '201.0')
+                self._log_text.see('end')
+                self._log_text.config(state='disabled')
+            elif kind == 'summary':
+                self._show_summary(value)
+            elif kind == 'finished':
+                self._on_finished(*value)
+            elif kind == 'imported':
+                record, error = value
+                self._importing = False
+                self._set_controls_running(False)
+                if record:
+                    self._activate_table(record)
+                    report = record['import_summary']
+                    text = (f'Tabla «{record["name"]}»: {report["added"]:,} DUAs nuevos, '
+                            f'{report["existing"]:,} ya registrados y {report["invalid"]:,} entradas para revisar.')
+                    logging.info(text)
+                    self._action_hint.config(text=text)
+                    if not self._closing:
+                        messagebox.showinfo('Tabla actualizada' if record['appended'] else 'Tabla guardada',
+                                            text + '\n\nYa puedes continuar sin el Excel original.', parent=self)
+                elif not self._closing:
+                    self._status_label.config(text="No se pudo guardar la tabla", foreground=self.colors['ERROR'])
+                    messagebox.showerror('Importar tabla', error)
+        if self._closing and not self._running:
+            logging.getLogger().removeHandler(self._log_handler)
+            self.destroy()
             return
+        self.after(100, self._poll_events)
 
-        self.session['progress'] = {}
-        self.session['totals'] = {}
-        save_session(self.session)
+    def _show_summary(self, summary):
+        self._stats = summary
+        total, done = summary['total'], summary['succeeded']
+        pct = done / total * 100 if total else 0
+        self._counter_label.config(text=f"{done:,} / {total:,}")
+        self._pct_label.config(text=f"{pct:.1f}%")
+        self._progress_var.set(pct)
+        values = {**summary, 'remaining': total - done}
+        for key, label in self._metric_labels.items():
+            label.config(text=f"{values[key]:,}")
+        if summary['invalid']:
+            note = f"{summary['invalid']:,} entradas no son DUAs válidos. Revísalas en Base de datos."
+        else:
+            note = (f"{summary['retry']:,} pendientes de reintento automático al terminar la lista."
+                    if self._running and summary['retry'] else "Los resultados se guardan automáticamente.")
+        self._stats_label.config(text=note)
+        stopped = self._running and self._stop_event.is_set()
+        text = 'Deteniendo y guardando…' if stopped else (
+            'Consultando el portal…' if self._running else (
+                'Todo guardado' if total and total == done else 'Pendientes listos para retomar'))
+        self._status_label.config(text=text, foreground=self.colors['ACCENT'] if self._running else (
+            self.colors['WARNING'] if total > done else self.colors['SUCCESS']))
+        if not stopped:
+            self._update_actions()
 
-        self._counter_label.config(text="0 / —")
-        self._pct_label.config(text="0.0%")
-        self._progress_var.set(0)
-        self._stats = {'success': 0, 'failed': 0, 'skipped': 0, 'total': 0}
-        self._update_stats_label()
-        self._status_label.config(
-            text="Progreso reiniciado. Listo para iniciar desde 0.",
-            foreground='gray'
-        )
-        self._resume_from = -1
-        self._last_saved_index = -1
-        logging.info("Progreso reiniciado manualmente.")
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # Cierre
-    # ═════════════════════════════════════════════════════════════════════════
+    def _on_finished(self, summary, error):
+        self._set_controls_running(False)
+        if summary is not None:
+            self._show_summary(summary)
+        if error:
+            title, color = 'No se pudo terminar la consulta', self.colors['ERROR']
+        elif self._stop_event.is_set():
+            title, color = 'Detenido; pendientes guardados', self.colors['WARNING']
+        elif summary and summary['total'] == summary['succeeded']:
+            title, color = 'Completado', self.colors['SUCCESS']
+        else:
+            title, color = 'Finalizado con pendientes', self.colors['WARNING']
+        self._status_label.config(text=title, foreground=color)
+        if self._closing:
+            return
+        if error:
+            self._action_hint.config(text="Revisa Actividad para ver el error. Los resultados guardados se conservan.")
+            messagebox.showerror(title, error)
 
     def _on_close(self):
-        if threading.active_count() > 2:
-            if not messagebox.askyesno(
-                "Salir",
-                "Hay un proceso en curso. ¿Desea detenerlo y salir?",
-            ):
-                return
-            self._stop_event.set()
-        self.after(300, self.destroy)
+        self._closing = True
+        if self._running:
+            self._stop_processing()
+        # _poll_events espera cierre de workers y exportación antes de destruir Tk.
